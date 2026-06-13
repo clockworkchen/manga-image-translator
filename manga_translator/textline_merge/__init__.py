@@ -131,7 +131,7 @@ def merge_bboxes_text_region(bboxes: List[Quadrilateral], width, height):
 
     for ((u, ubox), (v, vbox)) in itertools.combinations(enumerate(bboxes), 2):
         # if quadrilateral_can_merge_region_coarse(ubox, vbox):
-        if quadrilateral_can_merge_region(ubox, vbox, aspect_ratio_tol=1.3, font_size_ratio_tol=2,
+        if quadrilateral_can_merge_region(ubox, vbox, aspect_ratio_tol=1.3, font_size_ratio_tol=1.3,
                                           char_gap_tolerance=1, char_gap_tolerance2=3):
             G.add_edge(u, v)
 

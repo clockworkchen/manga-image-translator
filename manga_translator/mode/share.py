@@ -151,7 +151,10 @@ class MangaShare:
                 return Response(content=result_bytes, media_type="application/octet-stream")
             except Exception as e:
                 self.lock.release()
-                raise HTTPException(status_code=500, detail=str(e))
+                import traceback as _tb
+                full_tb = _tb.format_exc()
+                print(f"SHARE ERROR: {full_tb}", flush=True)
+                raise HTTPException(status_code=500, detail=full_tb)
 
         @app.post("/execute/{method_name}")
         async def execute_method(request: Request, method_name: str = Path(...)):

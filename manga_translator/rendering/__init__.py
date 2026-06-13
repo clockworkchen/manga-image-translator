@@ -45,7 +45,7 @@ def count_text_length(text: str) -> float:
             length += 1.0
     return length
 
-def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock'], font_size_fixed: int, font_size_offset: int, font_size_minimum: int):  
+def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock'], font_size_fixed: int, font_size_offset: int, font_size_minimum: int, overflow_strategy: str = "expand", max_font_shrink_ratio: float = 0.5):  
     """
     Adjust text region size to accommodate font size and translated text length.
     
@@ -226,6 +226,30 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
             else:
                 dst_points = region.min_rect
 
+        # -- Overflow handling: enforce image boundaries --
+        img_h, img_w = img.shape[:2]
+        if overflow_strategy in ("shrink", "auto") and dst_points is not None:
+            pts = dst_points.reshape(-1, 2) if dst_points.ndim > 2 else dst_points
+            min_x, max_x = float(pts[:, 0].min()), float(pts[:, 0].max())
+            overflow_right = max(0, max_x - img_w + 1)
+            overflow_left = max(0, -float(pts[:, 0].min()))
+            if overflow_right > 0 or overflow_left > 0:
+                # Try shifting into bounds first
+                shift_x = -overflow_right if (overflow_right > 0 and min_x > overflow_right) else (overflow_left if overflow_left > 0 else 0)
+                if shift_x != 0:
+                    dst_points = dst_points.copy()
+                    if dst_points.ndim == 3:
+                        dst_points[:, :, 0] = dst_points[:, :, 0] + shift_x
+                    else:
+                        dst_points[:, 0] = dst_points[:, 0] + shift_x
+                # Re-check after shift
+                pts2 = dst_points.reshape(-1, 2)
+                if float(pts2[:, 0].max()) > img_w - 1 or float(pts2[:, 0].min()) < 0:
+                    # Shrink font and use original bbox (text will wrap)
+                    min_font = max(int(original_region_font_size * max_font_shrink_ratio), font_size_minimum, 4)
+                    target_font_size = max(min_font, int(target_font_size * 0.7))
+                    dst_points = region.min_rect
+
         # Store results and update font size
         dst_points_list.append(dst_points)  
         region.font_size = int(target_font_size)
@@ -242,14 +266,17 @@ async def dispatch(
     hyphenate: bool = True,
     render_mask: np.ndarray = None,
     line_spacing: int = None,
-    disable_font_border: bool = False
+    disable_font_border: bool = False,
+    overflow_strategy: str = "expand",
+    max_font_shrink_ratio: float = 0.5,
     ) -> np.ndarray:
 
     text_render.set_font(font_path)
     text_regions = list(filter(lambda region: region.translation, text_regions))
 
     # Resize regions that are too small
-    dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum)
+    dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum,
+                                                     overflow_strategy=overflow_strategy, max_font_shrink_ratio=max_font_shrink_ratio)
 
     # TODO: Maybe remove intersections
 
@@ -319,7 +346,9 @@ def render(
             line_spacing,
         )
     h, w, _ = temp_box.shape
-    r_temp = w / h
+    if h < 1 or w < 1:
+        return img
+    r_temp = float(w) / float(h)
 
     # Extend temporary box so that it has same ratio as original
     box = None  
