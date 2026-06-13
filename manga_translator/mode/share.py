@@ -22,11 +22,20 @@ SAFE_PICKLE_MODULES = frozenset({
     'manga_translator.utils',
     'manga_translator.utils.generic',
     'manga_translator.config',
+    # omegaconf: all submodules that may appear in pickle streams
     'omegaconf',
+    'omegaconf._impl',
+    'omegaconf._utils',
+    'omegaconf.base',
+    'omegaconf.basecontainer',
     'omegaconf.dictconfig',
+    'omegaconf.errors',
+    'omegaconf.grammar_parser',
+    'omegaconf.grammar_visitor',
     'omegaconf.listconfig',
     'omegaconf.nodes',
-    'omegaconf.basecontainer',
+    'omegaconf.omegaconf',
+    'omegaconf.resolvers',
 })
 
 class RestrictedUnpickler(pickle.Unpickler):
