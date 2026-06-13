@@ -15,14 +15,15 @@ COPY docker_start.sh /app/docker_start.sh
 COPY requirements.txt /app/requirements.txt
 COPY docker_prepare.py /app/docker_prepare.py
 
-# Clear stale bytecode caches and make startup script executable
+# Clear stale bytecode caches, fix line endings (Windows CRLF → LF), make executable
 RUN find /app -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null; \
     find /app -name '*.pyc' -delete 2>/dev/null; \
-    chmod +x /app/docker_start.sh; \
+    sed -i 's/\r//' /app/docker_start.sh && chmod +x /app/docker_start.sh; \
     echo "Build complete"
 
 ENV PYTHONPATH="/app"
 WORKDIR /app
 
-# Default entrypoint uses the baked-in startup script
+# Override base image ENTRYPOINT and set CMD to our startup script
+ENTRYPOINT []
 CMD ["bash", "/app/docker_start.sh"]
