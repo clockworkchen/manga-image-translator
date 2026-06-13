@@ -7,16 +7,22 @@ FROM manga-translator-patched:backup-20260613
 # Copy our patched source code (overrides the original /app files)
 COPY manga_translator/ /app/manga_translator/
 
-# Also copy any updated root-level files that may have changed
+# Copy JSON proxy and startup script (baked in, no runtime injection needed)
+COPY json_proxy.py /app/json_proxy.py
+COPY docker_start.sh /app/docker_start.sh
+
+# Also copy any updated root-level files
 COPY requirements.txt /app/requirements.txt
 COPY docker_prepare.py /app/docker_prepare.py
 
-# Clear any stale bytecode caches
+# Clear stale bytecode caches and make startup script executable
 RUN find /app -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null; \
     find /app -name '*.pyc' -delete 2>/dev/null; \
-    echo "Bytecode caches cleared"
+    chmod +x /app/docker_start.sh; \
+    echo "Build complete"
 
 ENV PYTHONPATH="/app"
 WORKDIR /app
 
-ENTRYPOINT ["python", "-m", "manga_translator"]
+# Default entrypoint uses the baked-in startup script
+CMD ["bash", "/app/docker_start.sh"]
