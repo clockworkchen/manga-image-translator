@@ -86,7 +86,7 @@ async def translate_image(request: Request):
         # Product-image mode: enable smart overflow handling and disable font border
         render_cfg = rc.setdefault("render", {})
         if not render_cfg.get("overflow_strategy"):
-            render_cfg["overflow_strategy"] = "auto"
+            render_cfg["overflow_strategy"] = "cascade"
         if "disable_font_border" not in render_cfg:
             render_cfg["disable_font_border"] = True
 
