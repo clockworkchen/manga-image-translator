@@ -109,7 +109,9 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
                 try:  
                     poly = Polygon(region.unrotated_min_rect[0])
                     minx, miny, maxx, maxy = poly.bounds
-                    poly = affinity.scale(poly, xfact=scale_x, yfact=1.0, origin=(minx, miny))        
+                    # Use center origin for centered text to expand symmetrically
+                    scale_origin = ((minx + maxx) / 2, miny) if region.alignment == 'center' else (minx, miny)
+                    poly = affinity.scale(poly, xfact=scale_x, yfact=1.0, origin=scale_origin)        
                 
                     pts = np.array(poly.exterior.coords[:4])  
                     dst_points = rotate_polygons(  
@@ -142,7 +144,9 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
                 try:  
                     poly = Polygon(region.unrotated_min_rect[0])
                     minx, miny, maxx, maxy = poly.bounds
-                    poly = affinity.scale(poly, xfact=1.0, yfact=scale_x, origin=(minx, miny))                    
+                    # Use center origin for centered text to expand symmetrically
+                    scale_origin = (minx, (miny + maxy) / 2) if region.alignment == 'center' else (minx, miny)
+                    poly = affinity.scale(poly, xfact=1.0, yfact=scale_x, origin=scale_origin)                    
                     
                     pts = np.array(poly.exterior.coords[:4])  
                     dst_points = rotate_polygons(  
@@ -386,9 +390,17 @@ def render(
                 box = np.zeros((h, w + w_ext * 2, 4), dtype=np.uint8)  
                 #print(f"Placing temp_box at position [:, :w] = [0:{h}, 0:{w}]")  
          
-                # The line is full, and there should be no empty columns on the left side of the text. Otherwise, when multiple text boxes are aligned on the left, the translated text cannot be aligned. Common scenarios: borderless comics, comic postscript.  
-                # When there are bubbles on the current page, it can be changed to center: box[0:h, w_ext:w_ext+w] = temp_box, requiring more accurate bubble detection. But not changing it doesn't have much impact.
-                box[0:h, 0:w] = temp_box  
+                # Position text based on alignment setting:
+                # - center: center text in padded box (product images)
+                # - right: right-align text
+                # - left/auto: left-align (original behavior for comics)
+                align = region.alignment
+                if align == 'center':
+                    box[0:h, w_ext:w_ext+w] = temp_box
+                elif align == 'right':
+                    box[0:h, w_ext*2:w_ext*2+w] = temp_box
+                else:
+                    box[0:h, 0:w] = temp_box
             else:  
                 #print("w_ext < 0, using original temp_box")  
                 box = temp_box.copy()  

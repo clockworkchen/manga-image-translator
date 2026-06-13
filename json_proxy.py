@@ -106,7 +106,7 @@ async def translate_image(request: Request):
     if rc.get("inpainter", {}).get("inpainter"):
         _set(config.inpainter, "inpainter", rc["inpainter"]["inpainter"])
     render_cfg = rc.get("render", {}) or {}
-    for rkey in ("direction", "disable_font_border", "font_size_offset",
+    for rkey in ("direction", "alignment", "disable_font_border", "font_size_offset",
                  "font_size_minimum", "no_hyphenation", "uppercase", "lowercase",
                  "overflow_strategy", "max_font_shrink_ratio"):
         _set(config.render, rkey, render_cfg.get(rkey))

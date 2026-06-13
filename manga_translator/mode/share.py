@@ -15,9 +15,12 @@ from manga_translator import MangaTranslator
 SAFE_PICKLE_MODULES = frozenset({
     'builtins',
     'collections',
+    'copy_reg',
     'numpy',
     'numpy.core.multiarray',
     'numpy.dtype',
+    'typing',
+    'typing_extensions',
     'manga_translator',
     'manga_translator.utils',
     'manga_translator.utils.generic',
