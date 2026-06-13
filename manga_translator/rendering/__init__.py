@@ -263,9 +263,42 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
                 pts2 = dst_points.reshape(-1, 2)
                 still_overflow = float(pts2[:, 0].max()) > img_w - 1 or float(pts2[:, 0].min()) < 0
                 
+                if still_overflow and single_axis_expanded:
+                    # Step 2b: Full expansion too wide - try max-fit expansion
+                    # Re-expand from original polygon with clamped scale to fill
+                    # available image width (with small margin)
+                    try:
+                        margin = 4
+                        poly_orig = Polygon(region.unrotated_min_rect[0])
+                        orig_minx, _, orig_maxx, _ = poly_orig.bounds
+                        orig_width = orig_maxx - orig_minx
+                        center_x_unrot = (orig_minx + orig_maxx) / 2
+                        # Max expansion: use full image width minus margin
+                        max_avail_width = img_w - margin * 2
+                        if orig_width > 0 and max_avail_width > orig_width:
+                            clamped_scale = max_avail_width / orig_width
+                            scale_origin = ((orig_minx + orig_maxx) / 2, poly_orig.bounds[1])
+                            poly_clamped = affinity.scale(poly_orig, xfact=clamped_scale, yfact=1.0, origin=scale_origin)
+                            pts_c = np.array(poly_clamped.exterior.coords[:4])
+                            dst_points = rotate_polygons(
+                                region.center, pts_c.reshape(1, -1), -region.angle,
+                                to_int=False
+                            ).reshape(-1, 4, 2)
+                            # Center horizontally in image
+                            pts_c2 = dst_points.reshape(-1, 2)
+                            cx_min, cx_max = float(pts_c2[:, 0].min()), float(pts_c2[:, 0].max())
+                            shift_to_center = margin - cx_min if cx_min < margin else 0
+                            if cx_max + shift_to_center > img_w - margin:
+                                shift_to_center = img_w - margin - cx_max
+                            if shift_to_center != 0:
+                                dst_points[:, :, 0] = dst_points[:, :, 0] + shift_to_center
+                            dst_points = dst_points.astype(np.int64)
+                            still_overflow = False
+                    except Exception:
+                        pass
+                
                 if still_overflow:
                     # Step 3: Fall back to original box (text wraps naturally)
-                    # Don't shrink font - just let wrapping handle it
                     dst_points = region.min_rect
                     # Only shrink as LAST resort if original box is somehow out of bounds
                     pts3 = dst_points.reshape(-1, 2) if dst_points.ndim > 2 else dst_points
