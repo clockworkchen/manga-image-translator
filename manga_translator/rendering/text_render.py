@@ -575,8 +575,9 @@ def put_text_vertical(font_size: int, text: str, h: int, alignment: str, fg: Tup
     # colorize
     canvas_border = np.clip(canvas_border, 0, 255)
     line_box = add_color(canvas_text, fg, canvas_border, bg)
-    # rect
-    x, y, w, h = cv2.boundingRect(canvas_border)
+    # rect: when bg is None canvas_border is all-zero; use canvas_text as fallback
+    bounding_src = canvas_border if bg is not None else canvas_text
+    x, y, w, h = cv2.boundingRect(bounding_src)
     return line_box[y:y+h, x:x+w]
 
 def select_hyphenator(lang: str):
@@ -1153,7 +1154,9 @@ def put_text_horizontal(font_size: int, text: str, width: int, height: int, alig
     canvas_border = np.clip(canvas_border, 0, 255)
     line_box = add_color(canvas_text, fg, canvas_border, bg)
 
-    x, y, w, h = cv2.boundingRect(canvas_border)
+    # rect: when bg is None canvas_border is all-zero; use canvas_text as fallback
+    bounding_src = canvas_border if bg is not None else canvas_text
+    x, y, w, h = cv2.boundingRect(bounding_src)
     return line_box[y:y+h, x:x+w]
 
 # def put_text(img: np.ndarray, text: str, line_count: int, x: int, y: int, w: int, h: int, fg: Tuple[int, int, int], bg: Optional[Tuple[int, int, int]]):
