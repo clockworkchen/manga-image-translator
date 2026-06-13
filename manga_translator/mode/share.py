@@ -21,7 +21,12 @@ SAFE_PICKLE_MODULES = frozenset({
     'manga_translator',
     'manga_translator.utils',
     'manga_translator.utils.generic',
-    'manga_translator.config'
+    'manga_translator.config',
+    'omegaconf',
+    'omegaconf.dictconfig',
+    'omegaconf.listconfig',
+    'omegaconf.nodes',
+    'omegaconf.basecontainer',
 })
 
 class RestrictedUnpickler(pickle.Unpickler):
