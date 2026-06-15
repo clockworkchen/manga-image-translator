@@ -93,6 +93,16 @@ async def translate_image(request: Request):
         if "disable_font_border" not in render_cfg:
             render_cfg["disable_font_border"] = True
 
+    # Convenience: a top-level "engine":"paddle" (or detector=="paddle_ocr")
+    # selects the PaddleOCR detector. PaddleOCR detects + recognizes in one pass,
+    # so it MUST be paired with the "paddle" passthrough OCR (otherwise another
+    # OCR would discard paddle's recognized text). PaddleOCR is much better at
+    # product/document images (finds small note lines, ignores decorative dashes).
+    engine = (rc.get("engine") or req.get("engine") or "").lower()
+    if engine == "paddle" or det_cfg.get("detector") == "paddle_ocr":
+        det_cfg["detector"] = "paddle_ocr"
+        rc.setdefault("ocr", {})["ocr"] = "paddle"
+
     _set(config.detector, "detector", det_cfg.get("detector"))
     _set(config.detector, "detection_size", det_cfg.get("detection_size"))
     _set(config.detector, "text_threshold", det_cfg.get("text_threshold"))
@@ -101,6 +111,9 @@ async def translate_image(request: Request):
 
     # ── OCR config ────────────────────────────────────────────────
     ocr_cfg = rc.get("ocr", {}) or {}
+    # If paddle detector is selected, force the paddle passthrough OCR.
+    if config.detector.detector == "paddle_ocr":
+        ocr_cfg["ocr"] = "paddle"
     _set(config.ocr, "ocr", ocr_cfg.get("ocr"))
     if ocr_cfg.get("prob") is not None:
         _set(config.ocr, "prob", ocr_cfg.get("prob"))
