@@ -329,8 +329,9 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
 def _resolve_overlaps(dst_points_list, text_regions):
     """Detect and resolve overlapping dst_points boxes.
     
-    When expanded text regions overlap, shrink them back toward their
-    original min_rect to eliminate collisions.
+    Strategy: When two expanded boxes overlap, only shrink the EXPANDED
+    portion. Never shrink below the original min_rect. Only shrink by the
+    minimum amount needed to eliminate the overlap.
     """
     if len(dst_points_list) <= 1:
         return dst_points_list
@@ -338,57 +339,63 @@ def _resolve_overlaps(dst_points_list, text_regions):
     def _get_xyxy(pts):
         """Get axis-aligned bounding box (x1, y1, x2, y2) from polygon points."""
         flat = pts.reshape(-1, 2)
-        return (float(flat[:, 0].min()), float(flat[:, 1].min()),
-                float(flat[:, 0].max()), float(flat[:, 1].max()))
+        return [float(flat[:, 0].min()), float(flat[:, 1].min()),
+                float(flat[:, 0].max()), float(flat[:, 1].max())]
     
-    def _boxes_overlap(b1, b2, margin=2):
-        """Check if two AABB boxes overlap (with small margin)."""
-        return not (b1[2] <= b2[0] + margin or b1[0] >= b2[2] - margin or
-                    b1[3] <= b2[1] + margin or b1[1] >= b2[3] - margin)
+    def _boxes_overlap(b1, b2):
+        """Check if two AABB boxes overlap."""
+        return not (b1[2] <= b2[0] or b1[0] >= b2[2] or
+                    b1[3] <= b2[1] or b1[1] >= b2[3])
     
-    def _overlap_area(b1, b2):
-        """Calculate overlap area between two AABB boxes."""
-        dx = min(b1[2], b2[2]) - max(b1[0], b2[0])
-        dy = min(b1[3], b2[3]) - max(b1[1], b2[1])
-        if dx > 0 and dy > 0:
-            return dx * dy
-        return 0
-    
-    # Get bounding boxes
+    # Get current boxes and original (min_rect) boxes
     boxes = [_get_xyxy(pts) for pts in dst_points_list]
+    orig_boxes = [_get_xyxy(text_regions[i].min_rect) for i in range(len(text_regions))]
     
-    # Detect and resolve overlaps
-    max_iterations = 3
-    for iteration in range(max_iterations):
-        found_overlap = False
-        for i in range(len(boxes)):
-            for j in range(i + 1, len(boxes)):
-                if not _boxes_overlap(boxes[i], boxes[j]):
-                    continue
-                found_overlap = True
-                
-                oa = _overlap_area(boxes[i], boxes[j])
-                area_i = max((boxes[i][2] - boxes[i][0]) * (boxes[i][3] - boxes[i][1]), 1)
-                area_j = max((boxes[j][2] - boxes[j][0]) * (boxes[j][3] - boxes[j][1]), 1)
-                
-                # Shrink the region with larger overlap ratio back to min_rect
-                ratio_i = oa / area_i
-                ratio_j = oa / area_j
-                
-                # Shrink both overlapping regions back to their original min_rect
-                if ratio_i > 0.1 or ratio_j > 0.1:
-                    for idx in (i, j):
-                        orig_rect = text_regions[idx].min_rect
-                        orig_box = _get_xyxy(orig_rect)
-                        # Blend: move 70% toward original min_rect
-                        current = dst_points_list[idx].astype(np.float64)
-                        original = orig_rect.astype(np.float64)
-                        if current.shape == original.shape:
-                            dst_points_list[idx] = (current * 0.3 + original * 0.7).astype(np.int64)
-                            boxes[idx] = _get_xyxy(dst_points_list[idx])
-        
-        if not found_overlap:
-            break
+    # For each pair of overlapping boxes, clip expansion to avoid overlap
+    # Only handle HORIZONTAL overlap (most common with single-axis expansion)
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            if not _boxes_overlap(boxes[i], boxes[j]):
+                continue
+            
+            # Check if original (unexpanded) boxes also overlap
+            if _boxes_overlap(orig_boxes[i], orig_boxes[j]):
+                # Original boxes already overlap - nothing we can do
+                continue
+            
+            # Calculate overlap amount
+            overlap_x = min(boxes[i][2], boxes[j][2]) - max(boxes[i][0], boxes[j][0])
+            overlap_y = min(boxes[i][3], boxes[j][3]) - max(boxes[i][1], boxes[j][1])
+            
+            if overlap_x <= 0 or overlap_y <= 0:
+                continue
+            
+            # Determine which box was expanded more (has more "extra" space)
+            expanded_i = (boxes[i][2] - boxes[i][0]) - (orig_boxes[i][2] - orig_boxes[i][0])
+            expanded_j = (boxes[j][2] - boxes[j][0]) - (orig_boxes[j][2] - orig_boxes[j][0])
+            
+            # Clip the more-expanded box back, proportional to expansion
+            total_expansion = max(expanded_i + expanded_j, 1)
+            clip_i = overlap_x * expanded_i / total_expansion
+            clip_j = overlap_x * expanded_j / total_expansion
+            
+            # Apply minimal clipping (only reduce width, preserve center)
+            if clip_i > 1 and expanded_i > 0:
+                current = dst_points_list[i].astype(np.float64)
+                original = text_regions[i].min_rect.astype(np.float64)
+                # Blend minimally toward original (only enough to remove overlap)
+                blend = min(clip_i / max(expanded_i, 1), 0.8)
+                if current.shape == original.shape:
+                    dst_points_list[i] = (current * (1 - blend) + original * blend).astype(np.int64)
+                    boxes[i] = _get_xyxy(dst_points_list[i])
+            
+            if clip_j > 1 and expanded_j > 0:
+                current = dst_points_list[j].astype(np.float64)
+                original = text_regions[j].min_rect.astype(np.float64)
+                blend = min(clip_j / max(expanded_j, 1), 0.8)
+                if current.shape == original.shape:
+                    dst_points_list[j] = (current * (1 - blend) + original * blend).astype(np.int64)
+                    boxes[j] = _get_xyxy(dst_points_list[j])
     
     return dst_points_list
 
