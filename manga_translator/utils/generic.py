@@ -664,6 +664,18 @@ def quadrilateral_can_merge_region(a: Quadrilateral, b: Quadrilateral, ratio = 1
         return False
     if max(a.font_size, b.font_size) / char_size > font_size_ratio_tol:
         return False
+    # Prevent merging text from different columns/scattered positions:
+    # If both are horizontal and X-centroids are far apart relative to Y-centroids,
+    # they are likely in different columns and should NOT merge.
+    cx1, cy1 = x1 + w1 / 2, y1 + h1 / 2
+    cx2, cy2 = x2 + w2 / 2, y2 + h2 / 2
+    both_horizontal = (w1 > h1 * 1.2 and w2 > h2 * 1.2)
+    if both_horizontal:
+        x_gap = abs(cx1 - cx2)
+        y_gap = abs(cy1 - cy2)
+        # X-centers much farther apart than Y-centers = different columns
+        if x_gap > char_size * 6 and x_gap > y_gap * 3:
+            return False
     if a.aspect_ratio > aspect_ratio_tol and b.aspect_ratio < 1. / aspect_ratio_tol:
         return False
     if b.aspect_ratio > aspect_ratio_tol and a.aspect_ratio < 1. / aspect_ratio_tol:

@@ -326,6 +326,72 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
 
     return dst_points_list
 
+def _resolve_overlaps(dst_points_list, text_regions):
+    """Detect and resolve overlapping dst_points boxes.
+    
+    When expanded text regions overlap, shrink them back toward their
+    original min_rect to eliminate collisions.
+    """
+    if len(dst_points_list) <= 1:
+        return dst_points_list
+    
+    def _get_xyxy(pts):
+        """Get axis-aligned bounding box (x1, y1, x2, y2) from polygon points."""
+        flat = pts.reshape(-1, 2)
+        return (float(flat[:, 0].min()), float(flat[:, 1].min()),
+                float(flat[:, 0].max()), float(flat[:, 1].max()))
+    
+    def _boxes_overlap(b1, b2, margin=2):
+        """Check if two AABB boxes overlap (with small margin)."""
+        return not (b1[2] <= b2[0] + margin or b1[0] >= b2[2] - margin or
+                    b1[3] <= b2[1] + margin or b1[1] >= b2[3] - margin)
+    
+    def _overlap_area(b1, b2):
+        """Calculate overlap area between two AABB boxes."""
+        dx = min(b1[2], b2[2]) - max(b1[0], b2[0])
+        dy = min(b1[3], b2[3]) - max(b1[1], b2[1])
+        if dx > 0 and dy > 0:
+            return dx * dy
+        return 0
+    
+    # Get bounding boxes
+    boxes = [_get_xyxy(pts) for pts in dst_points_list]
+    
+    # Detect and resolve overlaps
+    max_iterations = 3
+    for iteration in range(max_iterations):
+        found_overlap = False
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                if not _boxes_overlap(boxes[i], boxes[j]):
+                    continue
+                found_overlap = True
+                
+                oa = _overlap_area(boxes[i], boxes[j])
+                area_i = max((boxes[i][2] - boxes[i][0]) * (boxes[i][3] - boxes[i][1]), 1)
+                area_j = max((boxes[j][2] - boxes[j][0]) * (boxes[j][3] - boxes[j][1]), 1)
+                
+                # Shrink the region with larger overlap ratio back to min_rect
+                ratio_i = oa / area_i
+                ratio_j = oa / area_j
+                
+                # Shrink both overlapping regions back to their original min_rect
+                if ratio_i > 0.1 or ratio_j > 0.1:
+                    for idx in (i, j):
+                        orig_rect = text_regions[idx].min_rect
+                        orig_box = _get_xyxy(orig_rect)
+                        # Blend: move 70% toward original min_rect
+                        current = dst_points_list[idx].astype(np.float64)
+                        original = orig_rect.astype(np.float64)
+                        if current.shape == original.shape:
+                            dst_points_list[idx] = (current * 0.3 + original * 0.7).astype(np.int64)
+                            boxes[idx] = _get_xyxy(dst_points_list[idx])
+        
+        if not found_overlap:
+            break
+    
+    return dst_points_list
+
 async def dispatch(
     img: np.ndarray,
     text_regions: List[TextBlock],
@@ -348,7 +414,8 @@ async def dispatch(
     dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum,
                                                      overflow_strategy=overflow_strategy, max_font_shrink_ratio=max_font_shrink_ratio)
 
-    # TODO: Maybe remove intersections
+    # Resolve overlapping text boxes to prevent text-on-text rendering
+    dst_points_list = _resolve_overlaps(dst_points_list, text_regions)
 
     # Render text
     for region, dst_points in tqdm(zip(text_regions, dst_points_list), '[render]', total=len(text_regions)):
