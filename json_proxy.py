@@ -99,9 +99,22 @@ async def translate_image(request: Request):
     # OCR would discard paddle's recognized text). PaddleOCR is much better at
     # product/document images (finds small note lines, ignores decorative dashes).
     engine = (rc.get("engine") or req.get("engine") or "").lower()
+    # PaddleOCR is the DEFAULT detection+recognition engine for this build: it is
+    # far better on product/document images and keeps a single engine for the
+    # whole lifecycle. It is only skipped if the caller explicitly asks for a
+    # different detector (e.g. detector="ctd"/"default" for manga).
+    if not engine and not det_cfg.get("detector"):
+        engine = "paddle"
     if engine == "paddle" or det_cfg.get("detector") == "paddle_ocr":
         det_cfg["detector"] = "paddle_ocr"
         rc.setdefault("ocr", {})["ocr"] = "paddle"
+        # Paddle = product-image mode: borderless text + cascade layout by default
+        # (disable_font_border avoids the bold/outline look on re-rendered text).
+        _rc_render = rc.setdefault("render", {})
+        if "disable_font_border" not in _rc_render:
+            _rc_render["disable_font_border"] = True
+        if not _rc_render.get("overflow_strategy"):
+            _rc_render["overflow_strategy"] = "cascade"
 
     _set(config.detector, "detector", det_cfg.get("detector"))
     _set(config.detector, "detection_size", det_cfg.get("detection_size"))
@@ -188,13 +201,41 @@ async def translate_image(request: Request):
     # MT used for rendering — far more reliable than pixel analysis.
     if req.get("debug"):
         regions_meta = _extract_regions_meta(result)
+        raw_dets = _extract_raw_detections(result)
         return {
             "image": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
             "regions": regions_meta,
             "region_count": len(regions_meta),
+            "raw_detections": raw_dets,
+            "raw_detection_count": len(raw_dets),
         }
 
     return Response(content=buf.getvalue(), media_type="image/png")
+
+
+def _extract_raw_detections(result):
+    """Extract the RAW detector textlines (pre-merge) for diagnostics.
+
+    PaddleOCR detects every line separately; MT then merges/filters them (e.g.
+    English/numeric lines are skipped for CHS->ENG). Exposing the raw detections
+    lets the diagnostic show the TRUE detection coverage vs the final regions.
+    """
+    import numpy as _np
+    out = []
+    textlines = getattr(result, "textlines", None) or []
+    for i, t in enumerate(textlines):
+        try:
+            pts = getattr(t, "pts", None)
+            arr = _np.array(pts).reshape(-1, 2)
+            out.append({
+                "id": i,
+                "text": getattr(t, "text", None),
+                "x_min": int(arr[:, 0].min()), "y_min": int(arr[:, 1].min()),
+                "x_max": int(arr[:, 0].max()), "y_max": int(arr[:, 1].max()),
+            })
+        except Exception:
+            continue
+    return out
 
 
 def _extract_regions_meta(result):
@@ -203,34 +244,45 @@ def _extract_regions_meta(result):
     out = []
     import numpy as _np
 
+    def _aabb(v):
+        if v is None:
+            return None
+        try:
+            arr = _np.array(v).reshape(-1, 2)
+            return {
+                "x_min": int(arr[:, 0].min()), "y_min": int(arr[:, 1].min()),
+                "x_max": int(arr[:, 0].max()), "y_max": int(arr[:, 1].max()),
+            }
+        except Exception:
+            return None
+
     def _box(region):
         for attr in ("xyxy", "min_rect", "unrotated_min_rect"):
-            v = getattr(region, attr, None)
-            if v is None:
-                continue
-            try:
-                arr = _np.array(v).reshape(-1, 2)
-                return {
-                    "x_min": int(arr[:, 0].min()), "y_min": int(arr[:, 1].min()),
-                    "x_max": int(arr[:, 0].max()), "y_max": int(arr[:, 1].max()),
-                }
-            except Exception:
-                continue
+            b = _aabb(getattr(region, attr, None))
+            if b is not None:
+                return b
         return None
 
     for i, region in enumerate(regions):
         try:
             texts = getattr(region, "texts", None)
             lines = len(texts) if texts is not None else None
+            # Final rendered box (post expand/normalize/overlap-resolve) — the
+            # box the translated text is actually warped into. This is the real
+            # ground truth for overlap and displayed-size checks.
+            render_box = _aabb(getattr(region, "_render_dst", None))
             out.append({
                 "id": i,
                 "text": getattr(region, "text", None),
                 "translation": getattr(region, "translation", None),
                 "font_size": int(getattr(region, "font_size", 0) or 0),
+                "orig_font_size": int(getattr(region, "_orig_font_size", 0) or 0),
                 "alignment": getattr(region, "alignment", None),
                 "horizontal": bool(getattr(region, "horizontal", False)),
                 "lines": lines,
+                "render_lines": int(getattr(region, "_render_lines", 0) or 0) or None,
                 "box": _box(region),
+                "render_box": render_box,
             })
         except Exception as e:
             out.append({"id": i, "error": str(e)})

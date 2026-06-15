@@ -74,6 +74,8 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
         if original_region_font_size <= 0:  
             # logger.warning(f"Invalid original font size ({original_region_font_size}) for text '{region.translation}'. Using default value {font_size_minimum}.")  
             original_region_font_size = font_size_minimum
+        # Remember the detected (pre-resize) font size for diagnostics
+        region._orig_font_size = int(original_region_font_size)
 
         # Determine target font size
         current_base_font_size = original_region_font_size  
@@ -448,6 +450,198 @@ def _normalize_font_sizes(dst_points_list, text_regions):
             text_regions[i].font_size = int(target)
     return dst_points_list
 
+def _aabb_of(pts):
+    a = np.array(pts).reshape(-1, 2).astype(np.float64)
+    return [float(a[:, 0].min()), float(a[:, 1].min()), float(a[:, 0].max()), float(a[:, 1].max())]
+
+def _measure_ink_height(original_img, box):
+    """Measure the ACTUAL text ink height (px) of the original text in a box.
+
+    The detection box is often taller than the real glyphs (especially PaddleOCR
+    boxes), which would make the re-rendered text larger than the original. We
+    threshold the original crop and count rows that actually contain glyph ink.
+    Returns 0 if it can't be measured.
+    """
+    if original_img is None:
+        return 0
+    try:
+        h, w = original_img.shape[:2]
+        x1 = max(int(box[0]), 0); y1 = max(int(box[1]), 0)
+        x2 = min(int(box[2]), w); y2 = min(int(box[3]), h)
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            return 0
+        crop = original_img[y1:y2, x1:x2]
+        if crop.ndim == 3:
+            crop = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        _, th = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if th.mean() > 127:      # ensure text (minority) = 255
+            th = 255 - th
+        row_has_ink = (th > 0).sum(axis=1) > max(2, th.shape[1] * 0.02)
+        return int(row_has_ink.sum())
+    except Exception:
+        return 0
+
+def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, max_font_shrink_ratio, original_img=None):
+    """Neighbor-aware cascade layout for horizontal text (product-image mode).
+
+    Implements the intended cascade priority while keeping the displayed font as
+    close to the ORIGINAL detected size as possible:
+
+      1. EXPAND  : grow the box width up to the midpoint gap to row-neighbours
+                   (and image edge) - never crossing into a neighbour column.
+      2. WRAP    : if the translation still doesn't fit on the available width,
+                   it wraps to more lines at the SAME font size (box grows down).
+      3. SHRINK+WRAP : only if the wrapped block is taller than the vertical
+                   space available (gap to the row below / image edge) do we
+                   shrink the font - and we keep it wrapped (never collapse to a
+                   single squished line). This preserves size fidelity.
+
+    The box is sized to the text's NATURAL rendered dimensions at the chosen
+    font, so warpPerspective maps ~1:1 and the displayed size == chosen font.
+    """
+    if font_size_minimum == -1:
+        font_size_minimum = round((img.shape[0] + img.shape[1]) / 200)
+    font_size_minimum = max(1, font_size_minimum)
+
+    img_h, img_w = img.shape[:2]
+    margin = 4
+    boxes = [_aabb_of(r.min_rect) for r in text_regions]
+
+    # Per-line height basis = the ACTUAL original ink height (more faithful than
+    # the detection box, which is often padded). Fall back to detection box
+    # height when ink can't be measured. A small 1.1x gives a little headroom.
+    h_idxs = [i for i, r in enumerate(text_regions) if getattr(r, "horizontal", False) and r.translation]
+    line_h = {}
+    for i in h_idxs:
+        ink = _measure_ink_height(original_img, boxes[i])
+        det_h = boxes[i][3] - boxes[i][1]
+        # ink is the true glyph height; if unmeasured use det box height
+        line_h[i] = (ink * 1.1) if ink >= 6 else det_h
+
+    # Uniform body line-height: snap body lines to the group median so spec lines
+    # render at a consistent size. Large titles (>> median) keep their own size.
+    body_median = None
+    if len(h_idxs) >= 3:
+        hs = sorted(line_h[i] for i in h_idxs)
+        body_median = hs[len(hs) // 2]
+
+    # Common top per ROW: regions that share a row (strong vertical overlap, e.g.
+    # the left+right columns of a spec line) must start at the SAME y so their
+    # tops align. Anchor each region to the topmost detection box in its row.
+    row_top = {}
+    for i in h_idxs:
+        yi1, yi2 = boxes[i][1], boxes[i][3]
+        tops = [yi1]
+        for j in h_idxs:
+            if j == i:
+                continue
+            yj1, yj2 = boxes[j][1], boxes[j][3]
+            ov = min(yi2, yj2) - max(yi1, yj1)
+            if ov > 0.5 * min(yi2 - yi1, yj2 - yj1):
+                tops.append(yj1)
+        row_top[i] = min(tops)
+
+    for i, region in enumerate(text_regions):
+        if not getattr(region, "horizontal", False) or not region.translation:
+            continue  # vertical / empty -> keep existing dst_points
+
+        x1, y1, x2, y2 = boxes[i]
+        cx = (x1 + x2) / 2
+        h_i, w_i = line_h.get(i, y2 - y1), x2 - x1
+        # Snap body line-height to the group median for a uniform look
+        if body_median and h_i <= body_median * 1.8:
+            h_i = body_median
+
+        # ── Available bounds via midpoints to nearest neighbours ──
+        L, R, T, B = float(margin), float(img_w - margin), float(margin), float(img_h - margin)
+        for j, ob in enumerate(boxes):
+            if j == i:
+                continue
+            ox1, oy1, ox2, oy2 = ob
+            v_ov = min(y2, oy2) - max(y1, oy1)        # vertical overlap (same row?)
+            h_ov = min(x2, ox2) - max(x1, ox1)        # horizontal overlap (same column?)
+            if v_ov > 0.3 * min(h_i, oy2 - oy1):
+                if ox2 <= x1:                          # neighbour to the left
+                    L = max(L, (x1 + ox2) / 2)
+                elif ox1 >= x2:                        # neighbour to the right
+                    R = min(R, (x2 + ox1) / 2)
+            if h_ov > 0.3 * min(w_i, ox2 - ox1):
+                if oy2 <= y1:                          # neighbour above
+                    T = max(T, (y1 + oy2) / 2)
+                elif oy1 >= y2:                        # neighbour below
+                    B = min(B, (y2 + oy1) / 2)
+
+        # Per-line height = the ORIGINAL detected box height. The displayed text
+        # size is governed by render_box_height / num_lines (warpPerspective
+        # scales the rendered text to fill the box), so to restore the original
+        # size we make each rendered line exactly as tall as the detected line.
+        per_line = max(h_i, font_size_minimum)
+        min_per_line = max(per_line * max_font_shrink_ratio, font_size_minimum, 6)
+        target_lang = getattr(region, "target_lang", "en_US")
+
+        # Left-align = highest-fidelity mode: keep the ORIGINAL left edge and wrap
+        # at the ORIGINAL occupied width (only widening if a single word can't
+        # fit), so the layout matches the source as closely as possible.
+        # Center/auto = product mode: use the full available column width.
+        alignment = getattr(region, "alignment", "center")
+        left_mode = (alignment == "left")
+        orig_w = max(x2 - x1, per_line * 2.0)
+        if left_mode:
+            wrap_target = min(max(orig_w, per_line * 2.0), R - x1)
+        else:
+            wrap_target = max(R - L, per_line * 2.0)
+        avail_w = max(R - L, per_line * 2.0)
+        avail_h = max(B - T, per_line)
+
+        # Cascade: keep original per-line height; wrap within the target width
+        # (EXPAND bounded by neighbours -> WRAP). Only if the wrapped block is
+        # taller than the available height do we shrink the per-line height
+        # (SHRINK+WRAP), never collapsing to a squished single line.
+        chosen = None
+        plh = per_line
+        while True:
+            f = max(int(round(plh)), 6)
+            wrap_w = max(int(wrap_target), int(2 * f))
+            lines, widths = text_render.calc_horizontal(f, region.translation, wrap_w,
+                                                        int(avail_h), language=target_lang)
+            n = max(len(lines), 1)
+            maxw = max(widths) if widths else wrap_w
+            box_h = plh * n
+            box_w = min(maxw, avail_w)
+            chosen = (f, box_w, box_h, n)
+            if box_h <= avail_h or plh <= min_per_line:
+                break
+            # shrink per-line height to try to fit vertically
+            plh = max(min_per_line, plh * min(avail_h / box_h, 0.92))
+
+        f, box_w, box_h, n = chosen
+        region.font_size = int(f)
+        region._render_lines = int(n)
+
+        # Horizontal position: left-align anchors at the original left edge;
+        # center/auto centers within [L, R]. Both clamped to [L, R].
+        if left_mode:
+            nx1 = max(L, x1)
+            nx2 = nx1 + box_w
+            if nx2 > R:
+                nx2 = R
+                nx1 = max(L, R - box_w)
+        else:
+            half = box_w / 2.0
+            bxc = min(max(cx, L + half), R - half) if (R - L) >= box_w else (L + R) / 2.0
+            nx1, nx2 = bxc - half, bxc + half
+        # Vertical: anchor top to the ROW's common top (same-row columns align).
+        ny1 = max(T, row_top.get(i, y1))
+        if ny1 + box_h > B:
+            ny1 = max(T, B - box_h)
+        ny2 = ny1 + box_h
+
+        dst_points_list[i] = np.array(
+            [[[nx1, ny1], [nx2, ny1], [nx2, ny2], [nx1, ny2]]], dtype=np.int64
+        ).reshape(-1, 4, 2)
+
+    return dst_points_list
+
 async def dispatch(
     img: np.ndarray,
     text_regions: List[TextBlock],
@@ -461,23 +655,36 @@ async def dispatch(
     disable_font_border: bool = False,
     overflow_strategy: str = "cascade",
     max_font_shrink_ratio: float = 0.5,
+    original_img: np.ndarray = None,
     ) -> np.ndarray:
 
     text_render.set_font(font_path)
     text_regions = list(filter(lambda region: region.translation, text_regions))
 
-    # Resize regions that are too small
+    # Resize regions that are too small (baseline; also sets vertical-text boxes)
     dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum,
                                                      overflow_strategy=overflow_strategy, max_font_shrink_ratio=max_font_shrink_ratio)
 
-    # Normalize uneven font sizes (product-image mode) so no line looks bold
-    dst_points_list = _normalize_font_sizes(dst_points_list, text_regions)
-
-    # Resolve overlapping text boxes to prevent text-on-text rendering
-    dst_points_list = _resolve_overlaps(dst_points_list, text_regions)
+    if overflow_strategy in ("cascade", "auto"):
+        # Neighbor-aware cascade fit for horizontal text: expand->wrap->shrink+wrap,
+        # bounded by neighbour columns/rows so boxes never overlap, while keeping
+        # the displayed font as close to the original detected size as possible.
+        dst_points_list = _fit_regions_cascade(img, text_regions, dst_points_list,
+                                               font_size_minimum, max_font_shrink_ratio,
+                                               original_img=original_img)
+    else:
+        # Normalize uneven font sizes (product-image mode) so no line looks bold
+        dst_points_list = _normalize_font_sizes(dst_points_list, text_regions)
+        # Resolve overlapping text boxes to prevent text-on-text rendering
+        dst_points_list = _resolve_overlaps(dst_points_list, text_regions)
 
     # Render text
     for region, dst_points in tqdm(zip(text_regions, dst_points_list), '[render]', total=len(text_regions)):
+        # Store the FINAL render box (post expand/normalize/overlap-resolve) for diagnostics
+        try:
+            region._render_dst = np.array(dst_points).reshape(-1, 2).tolist()
+        except Exception:
+            pass
         if render_mask is not None:
             # set render_mask to 1 for the region that is inside dst_points
             cv2.fillConvexPoly(render_mask, dst_points.astype(np.int32), 1)

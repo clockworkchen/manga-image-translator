@@ -1378,7 +1378,8 @@ class MangaTranslator:
                                               config.render.font_size_minimum, not config.render.no_hyphenation, ctx.render_mask, config.render.line_spacing,
                                               config.render.disable_font_border,
                                               getattr(config.render, "overflow_strategy", "expand"),
-                                              getattr(config.render, "max_font_shrink_ratio", 0.5))
+                                              getattr(config.render, "max_font_shrink_ratio", 0.5),
+                                              original_img=ctx.img_rgb)
         return output
 
     def _result_path(self, path: str) -> str:
