@@ -76,13 +76,16 @@ async def translate_image(request: Request):
             except Exception: pass
 
     # Smart defaults for small-text / product-image mode:
-    # When text_threshold <= 0.3, auto-set box_threshold=0.3 and unclip_ratio=2.5
+    # When text_threshold <= 0.3, lower box_threshold and widen detection boxes.
+    # Verified on product images (testglass1): box_threshold=0.25 + unclip_ratio=3.5
+    # captures small note lines AND avoids truncating long spec lines (e.g.
+    # "适用场景：驾驶|出行|通勤" was being cut to "驾驶|出" with the old 2.5 ratio).
     text_th = det_cfg.get("text_threshold")
     if text_th and float(text_th) <= 0.3:
         if not det_cfg.get("box_threshold"):
-            det_cfg["box_threshold"] = 0.3
+            det_cfg["box_threshold"] = 0.25
         if not det_cfg.get("unclip_ratio"):
-            det_cfg["unclip_ratio"] = 2.5
+            det_cfg["unclip_ratio"] = 3.5
         # Product-image mode: enable smart overflow handling and disable font border
         render_cfg = rc.setdefault("render", {})
         if not render_cfg.get("overflow_strategy"):
@@ -166,7 +169,59 @@ async def translate_image(request: Request):
     except Exception as e:
         raise HTTPException(500, detail=f"Result decode error: {e}")
 
+    # ── Debug mode: return JSON with real text-region metadata ─────
+    # This is the ground truth for the diagnostic (translate_debug.py):
+    # the actual detected regions, their translations and the font sizes
+    # MT used for rendering — far more reliable than pixel analysis.
+    if req.get("debug"):
+        regions_meta = _extract_regions_meta(result)
+        return {
+            "image": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
+            "regions": regions_meta,
+            "region_count": len(regions_meta),
+        }
+
     return Response(content=buf.getvalue(), media_type="image/png")
+
+
+def _extract_regions_meta(result):
+    """Extract per-region metadata from the MT Context result for diagnostics."""
+    regions = getattr(result, "text_regions", None) or []
+    out = []
+    import numpy as _np
+
+    def _box(region):
+        for attr in ("xyxy", "min_rect", "unrotated_min_rect"):
+            v = getattr(region, attr, None)
+            if v is None:
+                continue
+            try:
+                arr = _np.array(v).reshape(-1, 2)
+                return {
+                    "x_min": int(arr[:, 0].min()), "y_min": int(arr[:, 1].min()),
+                    "x_max": int(arr[:, 0].max()), "y_max": int(arr[:, 1].max()),
+                }
+            except Exception:
+                continue
+        return None
+
+    for i, region in enumerate(regions):
+        try:
+            texts = getattr(region, "texts", None)
+            lines = len(texts) if texts is not None else None
+            out.append({
+                "id": i,
+                "text": getattr(region, "text", None),
+                "translation": getattr(region, "translation", None),
+                "font_size": int(getattr(region, "font_size", 0) or 0),
+                "alignment": getattr(region, "alignment", None),
+                "horizontal": bool(getattr(region, "horizontal", False)),
+                "lines": lines,
+                "box": _box(region),
+            })
+        except Exception as e:
+            out.append({"id": i, "error": str(e)})
+    return out
 
 
 @app.post("/exec")

@@ -63,7 +63,13 @@ def is_valuable_char(ch):
     return not is_punctuation(ch) and not is_control(ch) and not is_whitespace(ch) and not ch.isdigit()
 
 
+_SEPARATOR_ONLY_CHARS = set('ー-—–|_=~・. 	　')
+
+
 def is_valuable_text(text):
+    stripped = text.strip()
+    if stripped and all(ch in _SEPARATOR_ONLY_CHARS for ch in stripped):
+        return False
     for ch in text:
         if is_valuable_char(ch):
             return True

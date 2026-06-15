@@ -350,53 +350,102 @@ def _resolve_overlaps(dst_points_list, text_regions):
     # Get current boxes and original (min_rect) boxes
     boxes = [_get_xyxy(pts) for pts in dst_points_list]
     orig_boxes = [_get_xyxy(text_regions[i].min_rect) for i in range(len(text_regions))]
-    
-    # For each pair of overlapping boxes, clip expansion to avoid overlap
-    # Only handle HORIZONTAL overlap (most common with single-axis expansion)
+
+    def _expansion(box, orig, axis):
+        """How much the box grew vs its original on the given axis (0=x width, 1=y height)."""
+        if axis == 0:
+            return (box[2] - box[0]) - (orig[2] - orig[0])
+        return (box[3] - box[1]) - (orig[3] - orig[1])
+
+    # For each overlapping pair, resolve along the axis of MINIMUM penetration
+    # by blending the more-expanded box back toward its original min_rect.
+    # Handles both horizontal (side-by-side) and vertical (stacked) overlaps.
     for i in range(len(boxes)):
         for j in range(i + 1, len(boxes)):
             if not _boxes_overlap(boxes[i], boxes[j]):
                 continue
-            
-            # Check if original (unexpanded) boxes also overlap
+            # Original (unexpanded) boxes already overlap - nothing we can do
             if _boxes_overlap(orig_boxes[i], orig_boxes[j]):
-                # Original boxes already overlap - nothing we can do
                 continue
-            
-            # Calculate overlap amount
+
             overlap_x = min(boxes[i][2], boxes[j][2]) - max(boxes[i][0], boxes[j][0])
             overlap_y = min(boxes[i][3], boxes[j][3]) - max(boxes[i][1], boxes[j][1])
-            
             if overlap_x <= 0 or overlap_y <= 0:
                 continue
-            
-            # Determine which box was expanded more (has more "extra" space)
-            expanded_i = (boxes[i][2] - boxes[i][0]) - (orig_boxes[i][2] - orig_boxes[i][0])
-            expanded_j = (boxes[j][2] - boxes[j][0]) - (orig_boxes[j][2] - orig_boxes[j][0])
-            
-            # Clip the more-expanded box back, proportional to expansion
+
+            # Resolve along the axis with the smaller penetration (least disruptive)
+            axis = 0 if overlap_x <= overlap_y else 1
+            overlap = overlap_x if axis == 0 else overlap_y
+
+            expanded_i = _expansion(boxes[i], orig_boxes[i], axis)
+            expanded_j = _expansion(boxes[j], orig_boxes[j], axis)
             total_expansion = max(expanded_i + expanded_j, 1)
-            clip_i = overlap_x * expanded_i / total_expansion
-            clip_j = overlap_x * expanded_j / total_expansion
-            
-            # Apply minimal clipping (only reduce width, preserve center)
+            clip_i = overlap * max(expanded_i, 0) / total_expansion
+            clip_j = overlap * max(expanded_j, 0) / total_expansion
+
+            # Blend each box back toward its min_rect only enough to remove the
+            # overlap on the chosen axis. Never below min_rect (blend capped at 1).
             if clip_i > 1 and expanded_i > 0:
                 current = dst_points_list[i].astype(np.float64)
                 original = text_regions[i].min_rect.astype(np.float64)
-                # Blend minimally toward original (only enough to remove overlap)
-                blend = min(clip_i / max(expanded_i, 1), 0.8)
+                blend = min(clip_i / max(expanded_i, 1), 1.0)
                 if current.shape == original.shape:
                     dst_points_list[i] = (current * (1 - blend) + original * blend).astype(np.int64)
                     boxes[i] = _get_xyxy(dst_points_list[i])
-            
+
             if clip_j > 1 and expanded_j > 0:
                 current = dst_points_list[j].astype(np.float64)
                 original = text_regions[j].min_rect.astype(np.float64)
-                blend = min(clip_j / max(expanded_j, 1), 0.8)
+                blend = min(clip_j / max(expanded_j, 1), 1.0)
                 if current.shape == original.shape:
                     dst_points_list[j] = (current * (1 - blend) + original * blend).astype(np.int64)
                     boxes[j] = _get_xyxy(dst_points_list[j])
-    
+
+    return dst_points_list
+
+def _normalize_font_sizes(dst_points_list, text_regions):
+    """Normalize uneven font sizes among body text (product-image mode).
+
+    Detection often assigns inconsistent font sizes to spec lines that should
+    look uniform (e.g. 24,25,35,27,31 px), making some lines appear "bold"/
+    larger than their neighbours. For center/auto-aligned horizontal regions we
+    clamp oversized body lines down toward the body median and scale their box
+    proportionally so the rendered text is not upscaled (which would thicken
+    strokes). Large titles (font >> median) are left untouched.
+
+    Gated to product-style layouts: >= 3 horizontal center/auto regions.
+    """
+    idxs = [i for i, r in enumerate(text_regions)
+            if getattr(r, "horizontal", False)
+            and getattr(r, "alignment", None) in ("center", "auto")
+            and getattr(r, "font_size", 0) > 0]
+    if len(idxs) < 3:
+        return dst_points_list
+
+    fonts = sorted(text_regions[i].font_size for i in idxs)
+    median = fonts[len(fonts) // 2]
+    if median <= 0:
+        return dst_points_list
+
+    # Body = lines that are not much larger than the median (exclude titles)
+    body_idxs = [i for i in idxs if text_regions[i].font_size <= median * 1.8]
+    if len(body_idxs) < 3:
+        return dst_points_list
+    body_fonts = sorted(text_regions[i].font_size for i in body_idxs)
+    target = body_fonts[len(body_fonts) // 2]
+    if target <= 0:
+        return dst_points_list
+
+    for i in body_idxs:
+        cur = text_regions[i].font_size
+        # Only shrink lines that stick out as larger than the group
+        if cur > target * 1.15:
+            ratio = target / cur
+            pts = dst_points_list[i].astype(np.float64)
+            center = pts.reshape(-1, 2).mean(axis=0)
+            pts = (pts - center) * ratio + center
+            dst_points_list[i] = pts.astype(np.int64)
+            text_regions[i].font_size = int(target)
     return dst_points_list
 
 async def dispatch(
@@ -420,6 +469,9 @@ async def dispatch(
     # Resize regions that are too small
     dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum,
                                                      overflow_strategy=overflow_strategy, max_font_shrink_ratio=max_font_shrink_ratio)
+
+    # Normalize uneven font sizes (product-image mode) so no line looks bold
+    dst_points_list = _normalize_font_sizes(dst_points_list, text_regions)
 
     # Resolve overlapping text boxes to prevent text-on-text rendering
     dst_points_list = _resolve_overlaps(dst_points_list, text_regions)
