@@ -74,6 +74,37 @@ class PaddleOcrDetector(CommonDetector):
         mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
         return mask
 
+    @staticmethod
+    def _extract_colors(image: np.ndarray, pts: np.ndarray):
+        """Extract dominant foreground and background RGB colours from a text box.
+
+        Uses Otsu thresholding to separate text (minority dark/light pixels)
+        from background, then computes the mean colour of each group.
+        Returns (fg_r, fg_g, fg_b, bg_r, bg_g, bg_b).
+        """
+        h, w = image.shape[:2]
+        x, y, bw, bh = cv2.boundingRect(pts.astype(np.int32))
+        x2, y2 = min(x + bw, w), min(y + bh, h)
+        x, y = max(x, 0), max(y, 0)
+        if x2 <= x or y2 <= y:
+            return 0, 0, 0, 0, 0, 0
+        crop = image[y:y2, x:x2]
+        if crop.size == 0:
+            return 0, 0, 0, 0, 0, 0
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Text = minority polarity (fewer pixels)
+        if th.mean() > 127:
+            text_mask = (th == 0)
+        else:
+            text_mask = (th == 255)
+        bg_mask = ~text_mask
+        if text_mask.sum() < 4:
+            return 0, 0, 0, 255, 255, 255
+        fg_mean = crop[text_mask].mean(axis=0).astype(int)
+        bg_mean = crop[bg_mask].mean(axis=0).astype(int) if bg_mask.sum() > 0 else np.array([255, 255, 255])
+        return int(fg_mean[0]), int(fg_mean[1]), int(fg_mean[2]), int(bg_mean[0]), int(bg_mean[1]), int(bg_mean[2])
+
     async def _detect(self, image: np.ndarray, detect_size: int, text_threshold: float,
                       box_threshold: float, unclip_ratio: float, verbose: bool = False
                       ) -> Tuple[List[Quadrilateral], np.ndarray, np.ndarray]:
@@ -93,7 +124,10 @@ class PaddleOcrDetector(CommonDetector):
             if pts.shape[0] != 4:
                 x, y, bw, bh = cv2.boundingRect(pts.astype(np.int32))
                 pts = np.array([[x, y], [x + bw, y], [x + bw, y + bh], [x, y + bh]], dtype=np.int64)
-            textlines.append(Quadrilateral(pts.astype(np.int64), text, conf))
+            fr, fg, fb, br, bg_c, bb = self._extract_colors(image, pts)
+            textlines.append(Quadrilateral(pts.astype(np.int64), text, conf,
+                                           fg_r=fr, fg_g=fg, fg_b=fb,
+                                           bg_r=br, bg_g=bg_c, bg_b=bb))
             boxes.append(pts)
 
         mask_raw = self._build_stroke_mask(image, boxes) if boxes else \

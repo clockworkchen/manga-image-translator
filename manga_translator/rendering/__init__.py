@@ -235,6 +235,7 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
         # -- Overflow handling: cascade strategy --
         # Strategy: "cascade" (default) = expand > shift > wrap > shrink (priority order)
         #           "expand" = expand only (allow overflow, for comics)
+        #           "expand_wrap" = left-align, expand right to boundary, auto-wrap
         #           "wrap" = no expansion, let text wrap at original font size
         #           "shrink" = no expansion, shrink font to fit in original lines
         img_h, img_w = img.shape[:2]
@@ -318,6 +319,12 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
         
         elif overflow_strategy == "wrap":
             # Wrap-only: always use original box, no expansion, no shrink
+            dst_points = region.min_rect
+        
+        elif overflow_strategy == "expand_wrap":
+            # Expand+Wrap: let _fit_regions_cascade handle the layout
+            # (expand right from left edge, wrap at boundary).
+            # Start with original box; cascade will expand to boundary.
             dst_points = region.min_rect
         
         # "expand" strategy: keep expanded dst_points as-is (allow overflow)
@@ -450,6 +457,21 @@ def _normalize_font_sizes(dst_points_list, text_regions):
             text_regions[i].font_size = int(target)
     return dst_points_list
 
+def _is_primarily_cjk(text):
+    """True if text is primarily CJK (Chinese/Japanese/Korean) characters."""
+    if not text:
+        return False
+    cjk = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf'
+              or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af')
+    return cjk > len(text) * 0.3
+
+def _is_primarily_latin(text):
+    """True if text is primarily Latin (ASCII letters/digits)."""
+    if not text:
+        return False
+    lat = sum(1 for c in text if ('A' <= c <= 'Z') or ('a' <= c <= 'z') or ('0' <= c <= '9'))
+    return lat > len(text) * 0.3
+
 def _aabb_of(pts):
     a = np.array(pts).reshape(-1, 2).astype(np.float64)
     return [float(a[:, 0].min()), float(a[:, 1].min()), float(a[:, 0].max()), float(a[:, 1].max())]
@@ -576,10 +598,30 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
         # scales the rendered text to fill the box), so to restore the original
         # size we make each rendered line exactly as tall as the detected line.
         per_line = max(h_i, font_size_minimum)
+
+        # ─── Cross-script visual size adjustment ───
+        # CJK characters at N px are visually compact (square glyphs); Latin
+        # letters at the same N px are wider/more spread out.  When translating
+        # across scripts the "same pixel height" does NOT produce the same visual
+        # weight.  Adjust per_line to compensate:
+        #   Latin → CJK : scale UP  (CJK needs more px to match Latin readability)
+        #   CJK → Latin : scale DOWN (Latin at same px looks heavier/larger)
+        orig_text = getattr(region, 'text', '') or getattr(region, 'source', '') or ''
+        trans_text = region.translation or ''
+        if _is_primarily_latin(orig_text) and _is_primarily_cjk(trans_text):
+            # Latin → CJK: Chinese/Japanese needs ~1.4x the pixel height to look
+            # visually equivalent to the original Latin text.
+            per_line = max(per_line * 1.4, 20)
+        elif _is_primarily_cjk(orig_text) and _is_primarily_latin(trans_text):
+            # CJK → Latin: Latin at the same height looks larger/heavier.
+            # Only scale down for TITLES (large regions), body text is fine as-is.
+            if body_median and h_i > body_median * 1.5:
+                per_line *= 0.8
+
         # "wrap" = wrap-only: NEVER shrink the font (min == per_line). Other modes
         # may shrink as a last resort.
-        if strategy == "wrap":
-            min_per_line = per_line
+        if strategy in ("wrap", "expand_wrap"):
+            min_per_line = per_line   # never shrink font
         else:
             min_per_line = max(per_line * max_font_shrink_ratio, font_size_minimum, 6)
         target_lang = getattr(region, "target_lang", "en_US")
@@ -587,18 +629,22 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
         # Wrap target width:
         #  - left-align OR wrap-only = highest fidelity: wrap at the ORIGINAL
         #    occupied width (only widen if a single token can't fit), keep left edge.
+        #  - expand_wrap = left-align, expand right to boundary, then wrap.
         #  - center/auto cascade = product mode: use the full available column width.
         alignment = getattr(region, "alignment", "center")
-        left_mode = (alignment == "left") or (strategy == "wrap")
+        left_mode = (alignment == "left") or strategy in ("wrap", "expand_wrap")
         orig_w = max(x2 - x1, per_line * 2.0)
-        if left_mode:
+        if strategy == "expand_wrap":
+            # Expand+Wrap: use ALL available space to the right, then wrap
+            wrap_target = max(R - x1, orig_w)
+        elif left_mode:
             wrap_target = min(max(orig_w, per_line * 2.0), R - x1)
         else:
             wrap_target = max(R - L, per_line * 2.0)
         avail_w = max(R - L, per_line * 2.0)
-        # wrap-only/left may grow downward freely (no shrink), so allow full height
+        # wrap-only / expand_wrap may grow downward freely, so allow generous height
         avail_h = max(B - T, per_line)
-        if strategy == "wrap":
+        if strategy in ("wrap", "expand_wrap"):
             avail_h = max(avail_h, per_line * 12)  # effectively unlimited -> never shrink
 
         # Cascade: keep original per-line height; wrap within the target width
@@ -616,6 +662,11 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
             maxw = max(widths) if widths else wrap_w
             box_h = plh * n
             box_w = min(maxw, avail_w)
+            # Never shrink box below the original detection width: a short
+            # translation (e.g. 4 CJK chars replacing 17 Latin chars) should
+            # be rendered centered/left-aligned inside the original space,
+            # not squeezed into a tiny box.
+            box_w = max(box_w, min(orig_w, avail_w))
             chosen = (f, box_w, box_h, n)
             if box_h <= avail_h or plh <= min_per_line:
                 break
@@ -673,11 +724,12 @@ async def dispatch(
     dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum,
                                                      overflow_strategy=overflow_strategy, max_font_shrink_ratio=max_font_shrink_ratio)
 
-    if overflow_strategy in ("cascade", "auto", "wrap"):
-        # Neighbor-aware fit for horizontal text. All three modes keep the
+    if overflow_strategy in ("cascade", "auto", "wrap", "expand_wrap"):
+        # Neighbor-aware fit for horizontal text. All modes keep the
         # original per-line size and never overlap neighbours:
         #  - cascade/auto: expand (within neighbour bounds) -> wrap -> shrink+wrap
         #  - wrap: wrap-only at the ORIGINAL width, grow downward, NEVER shrink
+        #  - expand_wrap: left-align, expand right to boundary, wrap, NEVER shrink
         dst_points_list = _fit_regions_cascade(img, text_regions, dst_points_list,
                                                font_size_minimum, max_font_shrink_ratio,
                                                original_img=original_img,
