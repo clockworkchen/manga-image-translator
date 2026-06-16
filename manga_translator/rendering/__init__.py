@@ -481,7 +481,7 @@ def _measure_ink_height(original_img, box):
     except Exception:
         return 0
 
-def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, max_font_shrink_ratio, original_img=None):
+def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, max_font_shrink_ratio, original_img=None, strategy="cascade"):
     """Neighbor-aware cascade layout for horizontal text (product-image mode).
 
     Implements the intended cascade priority while keeping the displayed font as
@@ -576,22 +576,30 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
         # scales the rendered text to fill the box), so to restore the original
         # size we make each rendered line exactly as tall as the detected line.
         per_line = max(h_i, font_size_minimum)
-        min_per_line = max(per_line * max_font_shrink_ratio, font_size_minimum, 6)
+        # "wrap" = wrap-only: NEVER shrink the font (min == per_line). Other modes
+        # may shrink as a last resort.
+        if strategy == "wrap":
+            min_per_line = per_line
+        else:
+            min_per_line = max(per_line * max_font_shrink_ratio, font_size_minimum, 6)
         target_lang = getattr(region, "target_lang", "en_US")
 
-        # Left-align = highest-fidelity mode: keep the ORIGINAL left edge and wrap
-        # at the ORIGINAL occupied width (only widening if a single word can't
-        # fit), so the layout matches the source as closely as possible.
-        # Center/auto = product mode: use the full available column width.
+        # Wrap target width:
+        #  - left-align OR wrap-only = highest fidelity: wrap at the ORIGINAL
+        #    occupied width (only widen if a single token can't fit), keep left edge.
+        #  - center/auto cascade = product mode: use the full available column width.
         alignment = getattr(region, "alignment", "center")
-        left_mode = (alignment == "left")
+        left_mode = (alignment == "left") or (strategy == "wrap")
         orig_w = max(x2 - x1, per_line * 2.0)
         if left_mode:
             wrap_target = min(max(orig_w, per_line * 2.0), R - x1)
         else:
             wrap_target = max(R - L, per_line * 2.0)
         avail_w = max(R - L, per_line * 2.0)
+        # wrap-only/left may grow downward freely (no shrink), so allow full height
         avail_h = max(B - T, per_line)
+        if strategy == "wrap":
+            avail_h = max(avail_h, per_line * 12)  # effectively unlimited -> never shrink
 
         # Cascade: keep original per-line height; wrap within the target width
         # (EXPAND bounded by neighbours -> WRAP). Only if the wrapped block is
@@ -665,13 +673,15 @@ async def dispatch(
     dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum,
                                                      overflow_strategy=overflow_strategy, max_font_shrink_ratio=max_font_shrink_ratio)
 
-    if overflow_strategy in ("cascade", "auto"):
-        # Neighbor-aware cascade fit for horizontal text: expand->wrap->shrink+wrap,
-        # bounded by neighbour columns/rows so boxes never overlap, while keeping
-        # the displayed font as close to the original detected size as possible.
+    if overflow_strategy in ("cascade", "auto", "wrap"):
+        # Neighbor-aware fit for horizontal text. All three modes keep the
+        # original per-line size and never overlap neighbours:
+        #  - cascade/auto: expand (within neighbour bounds) -> wrap -> shrink+wrap
+        #  - wrap: wrap-only at the ORIGINAL width, grow downward, NEVER shrink
         dst_points_list = _fit_regions_cascade(img, text_regions, dst_points_list,
                                                font_size_minimum, max_font_shrink_ratio,
-                                               original_img=original_img)
+                                               original_img=original_img,
+                                               strategy=overflow_strategy)
     else:
         # Normalize uneven font sizes (product-image mode) so no line looks bold
         dst_points_list = _normalize_font_sizes(dst_points_list, text_regions)
