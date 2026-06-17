@@ -570,8 +570,12 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
         x1, y1, x2, y2 = boxes[i]
         cx = (x1 + x2) / 2
         h_i, w_i = line_h.get(i, y2 - y1), x2 - x1
-        # Snap body line-height to the group median for a uniform look
-        if body_median and h_i <= body_median * 1.8:
+        # Snap body line-height to the group median for a uniform look,
+        # but ONLY if this line is genuinely close to the median (within a
+        # narrow band). Lines that are clearly larger (titles) or clearly
+        # smaller (notes / disclaimers) keep their own measured height so
+        # the visual hierarchy is preserved.
+        if body_median and body_median * 0.8 <= h_i <= body_median * 1.3:
             h_i = body_median
 
         # ── Available bounds via midpoints to nearest neighbours ──
@@ -598,25 +602,6 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
         # scales the rendered text to fill the box), so to restore the original
         # size we make each rendered line exactly as tall as the detected line.
         per_line = max(h_i, font_size_minimum)
-
-        # ─── Cross-script visual size adjustment ───
-        # CJK characters at N px are visually compact (square glyphs); Latin
-        # letters at the same N px are wider/more spread out.  When translating
-        # across scripts the "same pixel height" does NOT produce the same visual
-        # weight.  Adjust per_line to compensate:
-        #   Latin → CJK : scale UP  (CJK needs more px to match Latin readability)
-        #   CJK → Latin : scale DOWN (Latin at same px looks heavier/larger)
-        orig_text = getattr(region, 'text', '') or getattr(region, 'source', '') or ''
-        trans_text = region.translation or ''
-        if _is_primarily_latin(orig_text) and _is_primarily_cjk(trans_text):
-            # Latin → CJK: Chinese/Japanese needs ~1.4x the pixel height to look
-            # visually equivalent to the original Latin text.
-            per_line = max(per_line * 1.4, 20)
-        elif _is_primarily_cjk(orig_text) and _is_primarily_latin(trans_text):
-            # CJK → Latin: Latin at the same height looks larger/heavier.
-            # Only scale down for TITLES (large regions), body text is fine as-is.
-            if body_median and h_i > body_median * 1.5:
-                per_line *= 0.8
 
         # "wrap" = wrap-only: NEVER shrink the font (min == per_line). Other modes
         # may shrink as a last resort.
