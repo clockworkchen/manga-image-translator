@@ -477,11 +477,19 @@ def _aabb_of(pts):
     return [float(a[:, 0].min()), float(a[:, 1].min()), float(a[:, 0].max()), float(a[:, 1].max())]
 
 def _measure_ink_height(original_img, box):
-    """Measure the ACTUAL text ink height (px) of the original text in a box.
+    """Measure the ACTUAL **per-line** text ink height (px) inside a box.
 
     The detection box is often taller than the real glyphs (especially PaddleOCR
-    boxes), which would make the re-rendered text larger than the original. We
-    threshold the original crop and count rows that actually contain glyph ink.
+    boxes), which would make the re-rendered text larger than the original, so we
+    threshold the original crop and look at rows that actually contain glyph ink.
+
+    IMPORTANT: a detection box may cover SEVERAL original text lines. Returning
+    the total inked-row count would then be a multi-line height, and the caller
+    uses this as the height of ONE line (and multiplies by the line count again),
+    which blew the rendered font up to roughly line-count times too big.
+    So we split the inked rows into runs — one run per original line — and return
+    a single line's height (the median run), which is what the caller needs.
+
     Returns 0 if it can't be measured.
     """
     if original_img is None:
@@ -499,7 +507,35 @@ def _measure_ink_height(original_img, box):
         if th.mean() > 127:      # ensure text (minority) = 255
             th = 255 - th
         row_has_ink = (th > 0).sum(axis=1) > max(2, th.shape[1] * 0.02)
-        return int(row_has_ink.sum())
+        total = int(row_has_ink.sum())
+        if total <= 0:
+            return 0
+
+        # Split into runs of consecutive inked rows: one run ≈ one original line.
+        runs = []
+        run = 0
+        for inked in row_has_ink:
+            if inked:
+                run += 1
+            elif run:
+                runs.append(run)
+                run = 0
+        if run:
+            runs.append(run)
+
+        # Drop hairline runs (underlines, borders, antialiasing) so they don't
+        # skew the estimate; keep them if that would leave nothing.
+        real = [r for r in runs if r >= 4] or runs
+        if not real:
+            return total
+
+        # Use the LOWER median. Two reasons to bias small:
+        #  - with an even number of lines the upper median overshoots (runs of
+        #    88 and 124 px must yield 88, not 124, to match the original size);
+        #  - touching lines can merge into one tall run, and a too-large basis
+        #    scales the font up, which is the visually worst failure.
+        real.sort()
+        return int(real[(len(real) - 1) // 2])
     except Exception:
         return 0
 
@@ -538,7 +574,12 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
         ink = _measure_ink_height(original_img, boxes[i])
         det_h = boxes[i][3] - boxes[i][1]
         # ink is the true glyph height; if unmeasured use det box height
-        line_h[i] = (ink * 1.1) if ink >= 6 else det_h
+        h = (ink * 1.1) if ink >= 6 else det_h
+        # Safety clamp: one line can never be taller than the detection box, which
+        # already includes padding. Without this, any mis-measure (busy artwork,
+        # inverted threshold, multi-line box) scales the font UP — the most jarring
+        # failure for the user. Clamping means we can only ever err slightly small.
+        line_h[i] = min(h, det_h) if det_h > 0 else h
 
     # Uniform body line-height: snap body lines to the group median so spec lines
     # render at a consistent size. Large titles (>> median) keep their own size.
