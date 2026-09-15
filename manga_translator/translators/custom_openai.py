@@ -17,9 +17,11 @@ from .keys import CUSTOM_OPENAI_API_KEY, CUSTOM_OPENAI_API_BASE, CUSTOM_OPENAI_M
 class CustomOpenAiTranslator(ConfigGPT, CommonTranslator):
     _INVALID_REPEAT_COUNT = 2  # 如果检测到"无效"翻译，最多重复 2 次
     _MAX_REQUESTS_PER_MINUTE = 40  # 每分钟最大请求次数
-    _TIMEOUT = 40  # 在重试之前等待服务器响应的时间（秒）
+    # 本地 30B 级模型在冷启动/高负载时首 token 常超过 40 秒；过早取消会让
+    # 同一提示反复从头生成，最终制造 4 次无效请求并把前端任务判失败。
+    _TIMEOUT = 120  # 在重试之前等待服务器响应的时间（秒）
     _RETRY_ATTEMPTS = 3  # 在放弃之前重试错误请求的次数
-    _TIMEOUT_RETRY_ATTEMPTS = 3  # 在放弃之前重试超时请求的次数
+    _TIMEOUT_RETRY_ATTEMPTS = 1  # 超时后只重试一次，避免取消风暴
     _RATELIMIT_RETRY_ATTEMPTS = 3  # 在放弃之前重试速率限制请求的次数
 
     # 最大令牌数量，用于控制处理的文本长度
@@ -48,6 +50,15 @@ class CustomOpenAiTranslator(ConfigGPT, CommonTranslator):
 
     def parse_args(self, args: TranslatorConfig):
         self.config = args.chatgpt_config
+        override = getattr(args, "llm_model", None)
+        if override:
+            self.model = str(override).strip()
+        api_base = getattr(args, "llm_api_base", None)
+        api_key = getattr(args, "llm_api_key", None)
+        if api_base:
+            self.client.base_url = str(api_base).rstrip("/")
+        if api_key:
+            self.client.api_key = str(api_key)
 
 
     def extract_capture_groups(self, text, regex=r"(.*)"):
