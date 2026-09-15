@@ -10,7 +10,7 @@ Exposes:  GET  /health        → {"ok": true}
 Internal manga-translator shared API runs on port 5005.
 This proxy listens on port 5003 (configurable via MT_PROXY_PORT env var).
 """
-import base64, io, os, pickle
+import base64, io, os, pickle, time
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
@@ -25,6 +25,24 @@ except ImportError:
 app = FastAPI()
 SHARED = os.environ.get("MT_SHARED_URL", "http://127.0.0.1:5005")
 PROXY_PORT = int(os.environ.get("MT_PROXY_PORT", "5003"))
+# A large image plus a slow LLM can legitimately take longer than five minutes.
+# Disable the internal read timeout by default: the public API is asynchronous and
+# callers poll the task record, while the shared worker already serializes work.
+SHARED_READ_TIMEOUT_SEC = float(os.environ.get("MT_SHARED_READ_TIMEOUT_SEC", "0"))
+
+
+def _shared_timeout():
+    import httpx
+    read_timeout = None if SHARED_READ_TIMEOUT_SEC <= 0 else SHARED_READ_TIMEOUT_SEC
+    return httpx.Timeout(connect=10.0, read=read_timeout, write=60.0, pool=10.0)
+
+
+def _connection_error_detail(exc: BaseException, elapsed_sec: float) -> str:
+    message = str(exc).strip() or repr(exc)
+    return (
+        f"Shared API connection error ({type(exc).__name__}) after "
+        f"{elapsed_sec:.1f}s: {message}"
+    )
 
 
 @app.get("/health")
@@ -72,14 +90,14 @@ async def translate_image(request: Request):
             config.translator.llm_model = str(llm_model).strip()
         except Exception:
             pass
-    for attr in ("llm_api_base", "llm_api_key"):
-        val = tr_cfg.get(attr)
+    llm_api_base = tr_cfg.get("llm_api_base")
+    llm_api_key = tr_cfg.get("llm_api_key")
+    for attr, val in (("llm_api_base", llm_api_base), ("llm_api_key", llm_api_key)):
         if val:
             try:
                 setattr(config.translator, attr, str(val).strip())
             except Exception:
                 pass
-
     # ── Detector config (text region detection) ───────────────────
     det_cfg = rc.get("detector", {}) or {}
     def _set(obj, attr, val):
@@ -182,15 +200,17 @@ async def translate_image(request: Request):
 
     # ── Call shared API via pickle ────────────────────────────────
     payload = pickle.dumps({"image": pil_image, "config": config})
+    started_at = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=300) as c:
+        async with httpx.AsyncClient(timeout=_shared_timeout()) as c:
             r = await c.post(
                 f"{SHARED}/simple_execute/translate",
                 content=payload,
                 headers={"Content-Type": "application/octet-stream"},
             )
     except Exception as e:
-        raise HTTPException(503, detail=f"Shared API connection error: {e}")
+        detail = _connection_error_detail(e, time.monotonic() - started_at)
+        raise HTTPException(503, detail=detail) from e
 
     if r.status_code == 429:
         raise HTTPException(429, detail="Translator is busy, please retry")
