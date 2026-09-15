@@ -62,8 +62,16 @@ class GroqTranslator(CommonTranslator):
 
 
     def parse_args(self, args):
-        #todo: is nver set
-        self.config = None
+        self.config = getattr(args, "chatgpt_config", None)
+        override = getattr(args, "llm_model", None)
+        if override:
+            self.model = str(override).strip()
+        api_key = getattr(args, "llm_api_key", None)
+        if api_key:
+            try:
+                self.client.api_key = str(api_key)
+            except Exception:
+                pass
 
     def _config_get(self, key: str, default=None):
         if not self.config:

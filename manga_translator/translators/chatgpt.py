@@ -80,6 +80,7 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
         self.prev_context = ""
         # 可选的回退模型（通过环境变量 OPENAI_FALLBACK_MODEL 指定）
         self._fallback_model = os.getenv("OPENAI_FALLBACK_MODEL")
+        self._llm_model = None
 
     def set_prev_context(self, text: str = ""):
         self.prev_context = text or ""     
@@ -87,6 +88,14 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
     def parse_args(self, args: CommonTranslator):
         """如果你有外部参数要解析，可在此对 self.config 做更新"""
         self.config = args.chatgpt_config
+        override = getattr(args, "llm_model", None)
+        self._llm_model = str(override).strip() if override else None
+        api_base = getattr(args, "llm_api_base", None)
+        api_key = getattr(args, "llm_api_key", None)
+        if api_base:
+            self.client.base_url = str(api_base).rstrip("/")
+        if api_key:
+            self.client.api_key = str(api_key)
 
     async def _ratelimit_sleep(self):
         """
@@ -718,7 +727,7 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
 
         # 发起请求 / Initiate the request
         response = await self.client.chat.completions.create(
-            model=OPENAI_MODEL,
+            model=self._llm_model or OPENAI_MODEL,
             messages=messages,
             max_completion_tokens=self._MAX_TOKENS // 2,
             temperature=self.temperature,

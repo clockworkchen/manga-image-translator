@@ -45,6 +45,7 @@ class CommonGPTTranslator(ConfigGPT, CommonTranslator):
 
         ConfigGPT.__init__(self, config_key=config_key)
         CommonTranslator.__init__(self)
+        self._llm_model = None
         
         # `_MAX_TOKENS` indicates the maximum output tokens.
         #   Unless specified otherwise: 
@@ -56,6 +57,22 @@ class CommonGPTTranslator(ConfigGPT, CommonTranslator):
 
     def parse_args(self, args: CommonTranslator):
         self.config = args.chatgpt_config
+        override = getattr(args, "llm_model", None)
+        self._llm_model = str(override).strip() if override else None
+        api_base = getattr(args, "llm_api_base", None)
+        api_key = getattr(args, "llm_api_key", None)
+        client = getattr(self, "client", None)
+        if client is not None:
+            if api_base:
+                try:
+                    client.base_url = str(api_base).rstrip("/")
+                except Exception:
+                    pass
+            if api_key:
+                try:
+                    client.api_key = str(api_key)
+                except Exception:
+                    pass
 
     @abstractmethod
     def count_tokens(self, text: str) -> int:

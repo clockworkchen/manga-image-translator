@@ -66,6 +66,19 @@ async def translate_image(request: Request):
     tr_cfg = rc.get("translator", {}) if rc else {}
     config.translator.translator = tr_cfg.get("translator") or req.get("translator") or "sugoi"
     config.translator.target_lang = tr_cfg.get("target_lang") or req.get("target_lang") or "CHS"
+    llm_model = tr_cfg.get("llm_model") or tr_cfg.get("model") or req.get("llm_model")
+    if llm_model:
+        try:
+            config.translator.llm_model = str(llm_model).strip()
+        except Exception:
+            pass
+    for attr in ("llm_api_base", "llm_api_key"):
+        val = tr_cfg.get(attr)
+        if val:
+            try:
+                setattr(config.translator, attr, str(val).strip())
+            except Exception:
+                pass
 
     # ── Detector config (text region detection) ───────────────────
     det_cfg = rc.get("detector", {}) or {}

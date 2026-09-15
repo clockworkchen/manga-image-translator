@@ -225,6 +225,12 @@ class TranslatorConfig(BaseModel):
     """Language translator to use"""
     target_lang: str = 'ENG' #todo: validate VALID_LANGUAGES #todo: convert to enum
     """Destination language"""
+    llm_model: Optional[str] = None
+    """Per-request LLM model override for OpenAI-compatible translators. Empty = env default."""
+    llm_api_base: Optional[str] = None
+    """Per-request OpenAI-compatible API base. Empty = env default."""
+    llm_api_key: Optional[str] = None
+    """Per-request OpenAI-compatible API key. Empty = env default."""
     no_text_lang_skip: bool = False
     """Dont skip text that is seemingly already in the target language."""
     skip_lang: Optional[str] = None

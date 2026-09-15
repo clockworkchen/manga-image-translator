@@ -61,6 +61,7 @@ class DeepseekTranslator(CommonGPTTranslator):
         self.token_count = 0
         self.token_count_last = 0
         self.config = None
+        self._llm_model = None
 
     def count_tokens(self, text: str):
         """
@@ -242,7 +243,7 @@ class DeepseekTranslator(CommonGPTTranslator):
         messages.append({"role": "user", "content": prompt})
 
         kwargs = {
-            'model': DEEPSEEK_MODEL,
+            'model': getattr(self, "_llm_model", None) or DEEPSEEK_MODEL,
             'messages': messages,
             
             # `max_tokens` only affects output token length. Set to max.
