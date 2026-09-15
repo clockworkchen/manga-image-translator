@@ -156,38 +156,56 @@ class MangaShare:
         async def execute_method(request: Request, method_name: str = Path(...)):
             self.check_nonce(request)
             self.check_lock()
-            method = self.get_fn(method_name)
-            attr = restricted_loads(await request.body())
             try:
+                # Everything after acquiring the lock must stay inside this try.
+                # Request-body reads, restricted unpickling, method lookup and the
+                # translation itself can all fail or be cancelled by ASGI. In
+                # particular asyncio.CancelledError inherits BaseException, not
+                # Exception, so releasing only in success/except Exception leaves
+                # the shared worker permanently locked after a client disconnect.
+                method = self.get_fn(method_name)
+                attr = restricted_loads(await request.body())
                 if asyncio.iscoroutinefunction(method):
                     result = await method(**attr)
                 else:
                     result = method(**attr)
-                self.lock.release()
                 result_bytes = pickle.dumps(result)
                 return Response(content=result_bytes, media_type="application/octet-stream")
-            except Exception as e:
-                self.lock.release()
+            except asyncio.CancelledError:
+                print("SHARE CANCELLED: request disconnected or timed out", flush=True)
+                raise
+            except Exception:
                 import traceback as _tb
                 full_tb = _tb.format_exc()
                 print(f"SHARE ERROR: {full_tb}", flush=True)
                 raise HTTPException(status_code=500, detail=full_tb)
+            finally:
+                if self.lock.locked():
+                    self.lock.release()
 
         @app.post("/execute/{method_name}")
-        async def execute_method(request: Request, method_name: str = Path(...)):
+        async def execute_stream_method(request: Request, method_name: str = Path(...)):
             self.check_nonce(request)
             self.check_lock()
-            method = self.get_fn(method_name)
-            attr = restricted_loads(await request.body())
+            task_started = False
+            try:
+                method = self.get_fn(method_name)
+                attr = restricted_loads(await request.body())
 
-            # 根据端点类型决定是否使用占位符优化
-            config = attr.get('config')
-            self.manga._is_streaming_mode = getattr(config, '_web_frontend_optimized', False) if config else False
+                # 根据端点类型决定是否使用占位符优化
+                config = attr.get('config')
+                self.manga._is_streaming_mode = getattr(config, '_web_frontend_optimized', False) if config else False
 
-            # streaming response
-            streaming_response = StreamingResponse(self.progress_stream(), media_type="application/octet-stream")
-            asyncio.create_task(self.run_method(method, **attr))
-            return streaming_response
+                # run_method owns the lock after the task is created.
+                streaming_response = StreamingResponse(self.progress_stream(), media_type="application/octet-stream")
+                asyncio.create_task(self.run_method(method, **attr))
+                task_started = True
+                return streaming_response
+            finally:
+                # Validation, body parsing or task creation can fail before
+                # run_method gets a chance to release the lock.
+                if not task_started and self.lock.locked():
+                    self.lock.release()
 
         config = uvicorn.Config(app, host=self.host, port=self.port)
         server = uvicorn.Server(config)
