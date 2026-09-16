@@ -523,9 +523,20 @@ def _measure_ink_height(original_img, box):
         if run:
             runs.append(run)
 
-        # Drop hairline runs (underlines, borders, antialiasing) so they don't
+        # Drop hairline runs (underlines, bubble outline clipped into the box,
+        # the crossbar of a tall letter separated by antialiasing) so they don't
         # skew the estimate; keep them if that would leave nothing.
-        real = [r for r in runs if r >= 4] or runs
+        #
+        # This threshold MUST be relative to the tallest run, not an absolute
+        # pixel count. With the old `>= 4` rule a 4px sliver survived and, since
+        # the median below is deliberately biased low, it was then returned as
+        # "the height of one line": measured runs [4, 14, 2] -> 4, [4, 19] -> 19
+        # became 4, [4, 13, 2] -> 4. The caller treats anything under 6 as
+        # unmeasurable and falls back to the DETECTION BOX height, which includes
+        # padding, so the text was re-rendered about twice its original size -
+        # the "some lines are way too big" complaint.
+        tallest = max(runs)
+        real = [r for r in runs if r >= max(4, tallest * 0.4)] or runs
         if not real:
             return total
 
@@ -538,6 +549,171 @@ def _measure_ink_height(original_img, box):
         return int(real[(len(real) - 1) // 2])
     except Exception:
         return 0
+
+def _orig_line_count(region) -> int:
+    """How many printed lines the original text occupied."""
+    lines = getattr(region, "lines", None)
+    try:
+        return max(1, len(lines)) if lines is not None else 1
+    except TypeError:
+        return 1
+
+def _line_box_height(region) -> float:
+    """Median height of the region's own per-line boxes, or 0 if unavailable.
+
+    A recognizer that reports one box per printed line hands us the per-line
+    height directly, which is strictly better than inferring it from pixels.
+    Regions whose lines were never split (one quad for the whole block) return 0
+    so the caller falls back to ink measurement.
+    """
+    lines = getattr(region, "lines", None)
+    if lines is None:
+        return 0.0
+    try:
+        heights = []
+        for ln in lines:
+            pts = np.array(ln).reshape(-1, 2).astype(np.float64)
+            heights.append(float(pts[:, 1].max() - pts[:, 1].min()))
+    except Exception:
+        return 0.0
+    if len(heights) < 1:
+        return 0.0
+    heights.sort()
+    return heights[(len(heights) - 1) // 2]
+
+def _per_line_height(region, box, original_img) -> float:
+    """Height of ONE original line, the basis for the rendered font size.
+
+    Two independent estimates are available and each fails in the same
+    direction - too big - so the smaller one is taken:
+
+      * the region's own per-line boxes, which are exact when the recognizer
+        splits lines but include padding around the glyphs;
+      * ink-row measurement, which is tight on the glyphs but merges lines into
+        one run when the leading is small, and then reports the height of the
+        whole block (measured 56px for three 15px lines).
+
+    Over-estimating is the failure users notice - the text renders far larger
+    than the original - so a low estimate is always preferred, and the result is
+    finally capped by the share of the detection box one line can occupy.
+    """
+    det_h = box[3] - box[1]
+    n_lines = max(1, _orig_line_count(region))
+    candidates = []
+    per_line = _line_box_height(region)
+    if per_line >= 6:
+        candidates.append(per_line * 1.1)
+    ink = _measure_ink_height(original_img, box)
+    if ink >= 6:
+        candidates.append(ink * 1.1)
+    h = min(candidates) if candidates else det_h / n_lines
+    if det_h > 0:
+        h = min(h, det_h / n_lines * 1.2)
+    return h
+
+def _estimate_bubble_bounds(original_img, box, ink_h=0):
+    """Estimate the enclosing speech-bubble bounds (x1,y1,x2,y2) around a text box.
+
+    Why this exists: the cascade layout used to bound each region only by the
+    MIDPOINT GAP to neighbouring regions. On a product image (spec lines packed
+    in columns) that is the right constraint, but a comic bubble usually has no
+    neighbour in its row, so the "available width" became almost the whole image.
+    A short CJK translation of a wrapped English line then fit on ONE line and
+    the box was re-sized to that single line: the rendered text ended up ~1/4 the
+    original height and up to 1.6x wider than the bubble. Measured on a real
+    moderated page: 5/15 regions collapsed from 2-4 lines to 1, one going from a
+    131x72 box to 187x17.
+
+    The bubble interior is a near-uniform blob enclosing the glyphs, so we
+    threshold "close to the local background level", morphologically close the
+    gaps between strokes (so the blob is not cut apart by the text itself), and
+    take the connected component containing the text box.
+
+    Returns None when no plausible bubble is found (borderless text over
+    artwork, product images, gradients) - callers must then keep their previous
+    behaviour, which makes this self-gating: comics get bubble constraints,
+    product images are untouched.
+    """
+    if original_img is None:
+        return None
+    try:
+        h, w = original_img.shape[:2]
+        x1, y1, x2, y2 = (int(round(v)) for v in box)
+        bw, bh = x2 - x1, y2 - y1
+        if bw < 6 or bh < 6:
+            return None
+
+        # Search window: a bubble is rarely more than ~2x the text block wide and
+        # ~3x tall. Bounding the window also bounds the cost of this per region.
+        px, py = int(bw * 1.2), int(bh * 2.0 + 24)
+        sx1, sy1 = max(0, x1 - px), max(0, y1 - py)
+        sx2, sy2 = min(w, x2 + px), min(h, y2 + py)
+        crop = original_img[sy1:sy2, sx1:sx2]
+        if crop.size == 0:
+            return None
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.ndim == 3 else crop
+
+        # Local background level = the majority class inside the text box (the
+        # glyphs are the minority). Sampling outside the box would pick up the
+        # artwork instead of the bubble fill.
+        tb = gray[y1 - sy1:y2 - sy1, x1 - sx1:x2 - sx1]
+        if tb.size < 16:
+            return None
+        _, th = cv2.threshold(tb, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        fg_is_high = (th > 0).mean() <= 0.5
+        bg_pixels = tb[th == 0] if fg_is_high else tb[th > 0]
+        if bg_pixels.size == 0:
+            return None
+        bg_level = int(round(float(np.median(bg_pixels))))
+
+        # Flood fill the bubble interior. floodFill is the right tool here because
+        # it STOPS at the bubble's dark outline. (A global "close to bg" mask plus
+        # connected components does not: on a manga page the paper outside the
+        # bubble is white too, and the morphological closing needed to bridge the
+        # glyph strokes also bridges straight over the thin outline, so the
+        # component swallowed the whole panel - measured 513x128 for a 151x16
+        # text box. The glyphs stay as holes inside the filled area, which does
+        # not affect its bounding box, so no closing is needed at all.)
+        seed = None
+        cy_mid = (y1 + y2) // 2 - sy1
+        for yy in (cy_mid, (y1 - sy1 + cy_mid) // 2, min(gray.shape[0] - 1, y2 - sy1 + 1)):
+            if not (0 <= yy < gray.shape[0]):
+                continue
+            row = gray[yy]
+            xs = np.where(np.abs(row.astype(np.int16) - bg_level) <= 12)[0]
+            xs = xs[(xs >= x1 - sx1) & (xs < x2 - sx1)]
+            if xs.size:
+                seed = (int(xs[xs.size // 2]), int(yy))
+                break
+        if seed is None:
+            return None
+
+        ff = gray.copy()
+        ff_mask = np.zeros((gray.shape[0] + 2, gray.shape[1] + 2), np.uint8)
+        area, _, _, rect = cv2.floodFill(
+            ff, ff_mask, seed, 255, loDiff=40, upDiff=40,
+            flags=4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8))
+        bx1, by1 = sx1 + int(rect[0]), sy1 + int(rect[1])
+        bx2, by2 = bx1 + int(rect[2]), by1 + int(rect[3])
+
+        # Sanity: must actually enclose the text box, and must not be the open
+        # artwork background (which would swallow the whole search window).
+        if bx1 > x1 + 2 or by1 > y1 + 2 or bx2 < x2 - 2 or by2 < y2 - 2:
+            return None
+        win_area = max(1, (sx2 - sx1) * (sy2 - sy1))
+        if area > win_area * 0.85:
+            return None
+        # A real bubble has visible margin around its text. When the fill barely
+        # exceeds the text box the flood got stuck (seed inside a glyph counter,
+        # text almost filling a small bubble), and using it as a hard bound
+        # squeezes the translation into a couple of tiny lines - measured: a
+        # 44x26 box reported a 48x33 "bubble", and a single character ended up
+        # rendered as two 8px lines. Reject and let the caller stay unclamped.
+        if (bx2 - bx1) < bw * 1.15 or (by2 - by1) < bh * 1.15:
+            return None
+        return [float(bx1), float(by1), float(bx2), float(by2)]
+    except Exception:
+        return None
 
 def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, max_font_shrink_ratio, original_img=None, strategy="cascade"):
     """Neighbor-aware cascade layout for horizontal text (product-image mode).
@@ -571,15 +747,7 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
     h_idxs = [i for i, r in enumerate(text_regions) if getattr(r, "horizontal", False) and r.translation]
     line_h = {}
     for i in h_idxs:
-        ink = _measure_ink_height(original_img, boxes[i])
-        det_h = boxes[i][3] - boxes[i][1]
-        # ink is the true glyph height; if unmeasured use det box height
-        h = (ink * 1.1) if ink >= 6 else det_h
-        # Safety clamp: one line can never be taller than the detection box, which
-        # already includes padding. Without this, any mis-measure (busy artwork,
-        # inverted threshold, multi-line box) scales the font UP — the most jarring
-        # failure for the user. Clamping means we can only ever err slightly small.
-        line_h[i] = min(h, det_h) if det_h > 0 else h
+        line_h[i] = _per_line_height(text_regions[i], boxes[i], original_img)
 
     # Uniform body line-height: snap body lines to the group median so spec lines
     # render at a consistent size. Large titles (>> median) keep their own size.
@@ -656,22 +824,63 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
         #  - left-align OR wrap-only = highest fidelity: wrap at the ORIGINAL
         #    occupied width (only widen if a single token can't fit), keep left edge.
         #  - expand_wrap = left-align, expand right to boundary, then wrap.
-        #  - center/auto cascade = product mode: use the full available column width.
+        #  - center/auto cascade = start from the ORIGINAL block width, widen only
+        #    if the translation cannot fit in the original number of lines.
         alignment = getattr(region, "alignment", "center")
         left_mode = (alignment == "left") or strategy in ("wrap", "expand_wrap")
         orig_w = max(x2 - x1, per_line * 2.0)
+        # region.lines is a numpy array; `x or []` would evaluate its truth value.
+        _rlines = getattr(region, "lines", None)
+        orig_lines = max(1, len(_rlines) if _rlines is not None else 1)
+        avail_w = max(R - L, per_line * 2.0)
+        # wrap-only / expand_wrap may grow downward freely, so allow generous height
+        avail_h = max(B - T, per_line)
+        if strategy in ("wrap", "expand_wrap"):
+            avail_h = max(avail_h, per_line * 12)  # effectively unlimited -> never shrink
+
+        # Bubble bound (comics): a speech bubble usually has NO neighbour in its
+        # row, so R-L below is almost the whole image width. Clamp to the bubble
+        # when one is found; returns None on product images, leaving them as-is.
+        bubble = _estimate_bubble_bounds(original_img, [x1, y1, x2, y2], h_i)
+        if bubble:
+            pad = max(2.0, per_line * 0.25)
+            L = max(L, bubble[0] + pad)
+            R = min(R, bubble[2] - pad)
+            T = max(T, bubble[1] + pad)
+            B = min(B, bubble[3] - pad)
+            if R - L < per_line * 2.0 or B - T < per_line:
+                L, R, T, B = (float(margin), float(img_w - margin),
+                              float(margin), float(img_h - margin))
+            else:
+                avail_w = max(R - L, per_line * 2.0)
+                avail_h = max(B - T, per_line)
+
         if strategy == "expand_wrap":
             # Expand+Wrap: use ALL available space to the right, then wrap
             wrap_target = max(R - x1, orig_w)
         elif left_mode:
             wrap_target = min(max(orig_w, per_line * 2.0), R - x1)
         else:
-            wrap_target = max(R - L, per_line * 2.0)
-        avail_w = max(R - L, per_line * 2.0)
-        # wrap-only / expand_wrap may grow downward freely, so allow generous height
-        avail_h = max(B - T, per_line)
-        if strategy in ("wrap", "expand_wrap"):
-            avail_h = max(avail_h, per_line * 12)  # effectively unlimited -> never shrink
+            # Start from the ORIGINAL block width so the translation keeps the
+            # original footprint - and therefore roughly the original number of
+            # lines. Using the neighbour-column width here (the old behaviour)
+            # meant a 11-character CJK translation of a 4-line English bubble was
+            # laid out on ONE 165px-wide line inside a 131px-wide block: the text
+            # spilled out of the bubble and the block height collapsed to a
+            # quarter of the original. Widen toward the neighbour/bubble bound
+            # only when the text genuinely does not fit in orig_lines lines,
+            # which is what product images (longer target text) need.
+            wrap_target = min(orig_w, avail_w)
+            f0 = max(int(round(per_line)), 6)
+            guard = 0
+            while wrap_target < avail_w - 1 and guard < 12:
+                guard += 1
+                probe_lines, _ = text_render.calc_horizontal(
+                    f0, region.translation, max(int(wrap_target), 2 * f0),
+                    int(max(avail_h, per_line * 12)), language=target_lang)
+                if len(probe_lines) <= orig_lines:
+                    break
+                wrap_target = min(avail_w, wrap_target * 1.25)
 
         # Cascade: keep original per-line height; wrap within the target width
         # (EXPAND bounded by neighbours -> WRAP). Only if the wrapped block is

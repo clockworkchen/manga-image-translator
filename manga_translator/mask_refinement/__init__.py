@@ -6,7 +6,57 @@ from .text_mask_utils import complete_mask_fill, complete_mask
 from ..utils import TextBlock, Quadrilateral
 from ..utils.bubble import is_ignore
 
+def seed_unmasked_lines(raw_mask: np.ndarray, raw_image: np.ndarray,
+                        text_regions: List[TextBlock], min_coverage: float = 0.02) -> int:
+    """Add stroke mask for recognized lines the detector's mask never covered.
+
+    `complete_mask` only GROWS mask that already exists inside a textline, so a
+    line the detector's segmentation missed gets no mask at all, is never
+    inpainted, and the original lettering stays visible underneath the
+    translation. That happens on bold outlined text: on the reference page the
+    detector masked the small "THAT" but not the "SKINSUIT" below it, even though
+    it had returned a box covering both and OCR read both.
+
+    Seeding is per-line and stroke-level (Otsu inside the line box), never a
+    filled box: a solid box seed makes the refinement step treat the whole area
+    as text and inpaint it flat, which leaves a visible patch over the artwork.
+
+    Returns the number of lines seeded.
+    """
+    seeded = 0
+    h, w = raw_mask.shape[:2]
+    for region in text_regions:
+        lines = getattr(region, 'lines', None)
+        if lines is None:
+            continue
+        for line in lines:
+            pts = np.array(line).reshape(-1, 2).astype(np.int32)
+            x1, y1 = max(0, pts[:, 0].min()), max(0, pts[:, 1].min())
+            x2, y2 = min(w, pts[:, 0].max()), min(h, pts[:, 1].max())
+            if x2 - x1 < 4 or y2 - y1 < 4:
+                continue
+            window = raw_mask[y1:y2, x1:x2]
+            if window.size == 0 or (window > 0).mean() >= min_coverage:
+                continue
+            crop = raw_image[y1:y2, x1:x2]
+            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.ndim == 3 else crop
+            _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            if th.mean() > 127:      # keep the minority (the glyphs), not the paper
+                th = 255 - th
+            # A line box tight around the glyphs still clips the balloon outline
+            # at its corners often enough to matter, and masking the outline
+            # makes inpainting eat the balloon edge. Ignore a 1px frame.
+            th[0, :] = 0; th[-1, :] = 0; th[:, 0] = 0; th[:, -1] = 0
+            if (th > 0).mean() < 0.01:
+                continue                      # nothing that looks like ink
+            raw_mask[y1:y2, x1:x2] = np.maximum(window, th)
+            seeded += 1
+    return seeded
+
 async def dispatch(text_regions: List[TextBlock], raw_image: np.ndarray, raw_mask: np.ndarray, method: str = 'fit_text', dilation_offset: int = 0, ignore_bubble: int = 0, verbose: bool = False,kernel_size:int=3) -> np.ndarray:
+    raw_mask = raw_mask.copy()   # seeding must not mutate the caller's mask_raw
+    seed_unmasked_lines(raw_mask, raw_image, text_regions)
+
     # Larger sized mask images will probably have crisper and thinner mask segments due to being able to fit the text pixels better
     # so we dont want to size them down as much to not lose information
     scale_factor = max(min((raw_mask.shape[0] - raw_image.shape[0] / 3) / raw_mask.shape[0], 1), 0.5)

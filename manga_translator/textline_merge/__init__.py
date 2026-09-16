@@ -107,7 +107,12 @@ def split_text_region(
 #     box = np.array(box)
 #     return box
 
-def merge_bboxes_text_region(bboxes: List[Quadrilateral], width, height):
+def merge_bboxes_text_region(bboxes: List[Quadrilateral], width, height,
+                             font_size_ratio_tol: float = 1.3,
+                             aspect_ratio_tol: float = 1.3,
+                             char_gap_tolerance: float = 1,
+                             char_gap_tolerance2: float = 3,
+                             stacked_font_ratio_slack: float = 1.35):
     # step 0: merge quadrilaterals that belong to the same textline
     # u = 0
     # removed_counter = 0
@@ -131,8 +136,11 @@ def merge_bboxes_text_region(bboxes: List[Quadrilateral], width, height):
 
     for ((u, ubox), (v, vbox)) in itertools.combinations(enumerate(bboxes), 2):
         # if quadrilateral_can_merge_region_coarse(ubox, vbox):
-        if quadrilateral_can_merge_region(ubox, vbox, aspect_ratio_tol=1.3, font_size_ratio_tol=1.3,
-                                          char_gap_tolerance=1, char_gap_tolerance2=3):
+        if quadrilateral_can_merge_region(ubox, vbox, aspect_ratio_tol=aspect_ratio_tol,
+                                          font_size_ratio_tol=font_size_ratio_tol,
+                                          char_gap_tolerance=char_gap_tolerance,
+                                          char_gap_tolerance2=char_gap_tolerance2,
+                                          stacked_font_ratio_slack=stacked_font_ratio_slack):
             G.add_edge(u, v)
 
     # step 2: postprocess - further split each region
@@ -181,7 +189,8 @@ def merge_bboxes_text_region(bboxes: List[Quadrilateral], width, height):
         # yield overall bbox and sorted indices
         yield txtlns, (fg_r, fg_g, fg_b), (bg_r, bg_g, bg_b)
 
-async def dispatch(textlines: List[Quadrilateral], width: int, height: int, verbose: bool = False) -> List[TextBlock]:
+async def dispatch(textlines: List[Quadrilateral], width: int, height: int, verbose: bool = False,
+                   merge_opts: dict = None) -> List[TextBlock]:
     # print(width, height)
     # import re
     # for l in textlines:
@@ -190,7 +199,8 @@ async def dispatch(textlines: List[Quadrilateral], width: int, height: int, verb
     #     print(s)
 
     text_regions: List[TextBlock] = []
-    for (txtlns, fg_color, bg_color) in merge_bboxes_text_region(textlines, width, height):
+    for (txtlns, fg_color, bg_color) in merge_bboxes_text_region(textlines, width, height,
+                                                                 **(merge_opts or {})):
         total_logprobs = 0
         for txtln in txtlns:
             total_logprobs += np.log(txtln.prob) * txtln.area

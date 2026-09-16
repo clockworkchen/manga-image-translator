@@ -650,7 +650,24 @@ def distance_point_lineseg(p: np.ndarray, p1: np.ndarray, p2: np.ndarray):
     return np.sqrt(dx * dx + dy * dy)
 
 
-def quadrilateral_can_merge_region(a: Quadrilateral, b: Quadrilateral, ratio = 1.9, discard_connection_gap = 2, char_gap_tolerance = 0.6, char_gap_tolerance2 = 1.5, font_size_ratio_tol = 1.5, aspect_ratio_tol = 2) -> bool:
+def _looks_like_stacked_lines(b1, b2, char_size) -> bool:
+    """True if the two boxes look like consecutive lines of ONE text block.
+
+    Used to relax the font-size-ratio gate: see quadrilateral_can_merge_region.
+    Requires strong horizontal overlap (lines of a paragraph share a column) and
+    a vertical gap smaller than one line (no blank line between them).
+    """
+    x_ov = min(b1.x + b1.w, b2.x + b2.w) - max(b1.x, b2.x)
+    if x_ov <= 0.5 * min(b1.w, b2.w):
+        return False
+    y_gap = max(b1.y, b2.y) - min(b1.y + b1.h, b2.y + b2.h)
+    if y_gap > char_size * 0.8:
+        return False
+    # Must be stacked (one above the other), not side by side on the same line.
+    slack = char_size * 0.8
+    return (b1.y + b1.h <= b2.y + slack) or (b2.y + b2.h <= b1.y + slack)
+
+def quadrilateral_can_merge_region(a: Quadrilateral, b: Quadrilateral, ratio = 1.9, discard_connection_gap = 2, char_gap_tolerance = 0.6, char_gap_tolerance2 = 1.5, font_size_ratio_tol = 1.5, aspect_ratio_tol = 2, stacked_font_ratio_slack = 1.35) -> bool:
     b1 = a.aabb
     b2 = b.aabb
     char_size = min(a.font_size, b.font_size)
@@ -662,8 +679,25 @@ def quadrilateral_can_merge_region(a: Quadrilateral, b: Quadrilateral, ratio = 1
     dist = p1.distance(p2)
     if dist > discard_connection_gap * char_size:
         return False
-    if max(a.font_size, b.font_size) / char_size > font_size_ratio_tol:
-        return False
+    fs_ratio = max(a.font_size, b.font_size) / char_size
+    if fs_ratio > font_size_ratio_tol:
+        # A textline's "font_size" is estimated from its BOX HEIGHT, so two lines
+        # of the same real size measure very differently depending on glyph
+        # content: on a real page, three lines of one speech bubble came out
+        # 24 / 17 / 16 px because only the first had ascenders+descenders.
+        # A tight ratio therefore splits one sentence into several regions, and
+        # that is not merely cosmetic: each fragment is sent to the LLM as its
+        # own numbered query, the model recognises them as one sentence, merges
+        # its output into a single numbered line, and EVERY following region
+        # then receives the previous region's translation (measured: 5 wrong
+        # bubbles on one page, last bubble left untranslated).
+        # So allow a looser ratio when the pair looks like consecutive lines of
+        # one block; keep the tight ratio for anything else (side-by-side
+        # columns, a caption next to a title), which is what the tight value
+        # was introduced for on product images.
+        if (not _looks_like_stacked_lines(b1, b2, char_size)
+                or fs_ratio > font_size_ratio_tol * stacked_font_ratio_slack):
+            return False
     # Prevent merging text from different columns/scattered positions:
     # If both are horizontal and X-centroids are far apart relative to Y-centroids,
     # they are likely in different columns and should NOT merge.

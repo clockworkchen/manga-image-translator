@@ -1373,7 +1373,12 @@ class MangaTranslator:
             else:
                 output = await dispatch_eng_render(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, self.font_path, config.render.line_spacing, config.render.disable_font_border)
         else:
-            output = await dispatch_rendering(ctx.img_inpainted, ctx.text_regions, self.font_path, config.render.font_size,
+            # Pass a COPY: rendering.render() composites in place, so handing over
+            # ctx.img_inpainted turns the inpainted image into the rendered one.
+            # Anything that inspects ctx.img_inpainted afterwards (the verbose
+            # inpainted.png dump, diagnostics, or any caller reusing the returned
+            # context) then sees text that inpainting never produced.
+            output = await dispatch_rendering(ctx.img_inpainted.copy(), ctx.text_regions, self.font_path, config.render.font_size,
                                               config.render.font_size_offset,
                                               config.render.font_size_minimum, not config.render.no_hyphenation, ctx.render_mask, config.render.line_spacing,
                                               config.render.disable_font_border,
