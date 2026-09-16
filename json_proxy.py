@@ -136,7 +136,28 @@ async def translate_image(request: Request):
     # different detector (e.g. detector="ctd"/"default" for manga).
     if not engine and not det_cfg.get("detector"):
         engine = "paddle"
-    if engine == "paddle" or det_cfg.get("detector") == "paddle_ocr":
+
+    # engine="manga" (or detector=="ensemble" / ocr=="vlm"): the comic pipeline.
+    # Paddle is tuned for product images and is the wrong tool on comic pages;
+    # this pairs the ensemble detector (no single detector finds every balloon)
+    # with the VLM recognizer (the local models mangle stylized lettering and
+    # silently drop whole multi-line balloons). Thresholds are lowered because at
+    # the stock 0.5/0.7 a real balloon on the reference page was never detected.
+    if engine in ("manga", "vlm") or det_cfg.get("detector") == "ensemble" \
+            or (rc.get("ocr", {}) or {}).get("ocr") == "vlm":
+        if not det_cfg.get("detector"):
+            det_cfg["detector"] = "ensemble"
+        rc.setdefault("ocr", {})["ocr"] = "vlm"
+        det_cfg.setdefault("detection_size", 2048)
+        det_cfg.setdefault("text_threshold", 0.3)
+        det_cfg.setdefault("box_threshold", 0.4)
+        det_cfg.setdefault("unclip_ratio", 2.8)
+        _rc_render = rc.setdefault("render", {})
+        if "disable_font_border" not in _rc_render:
+            _rc_render["disable_font_border"] = True
+        if not _rc_render.get("overflow_strategy"):
+            _rc_render["overflow_strategy"] = "cascade"
+    elif engine == "paddle" or det_cfg.get("detector") == "paddle_ocr":
         det_cfg["detector"] = "paddle_ocr"
         rc.setdefault("ocr", {})["ocr"] = "paddle"
         # Paddle = product-image mode: borderless text + cascade layout by default
