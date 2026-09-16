@@ -33,6 +33,7 @@ from .ocr import dispatch as dispatch_ocr, prepare as prepare_ocr, unload as unl
 from .textline_merge import dispatch as dispatch_textline_merge
 from .mask_refinement import dispatch as dispatch_mask_refinement
 from .inpainting import dispatch as dispatch_inpainting, prepare as prepare_inpainting, unload as unload_inpainting
+from .inpainting.flat_bg import restore_flat_backgrounds
 from .translators import (
     dispatch as dispatch_translation,
     prepare as prepare_translation,
@@ -1358,8 +1359,14 @@ class MangaTranslator:
     async def _run_inpainting(self, config: Config, ctx: Context):
         current_time = time.time()
         self._model_usage_timestamps[("inpainting", config.inpainter.inpainter)] = current_time
-        return await dispatch_inpainting(config.inpainter.inpainter, ctx.img_rgb, ctx.mask, config.inpainter, config.inpainter.inpainting_size, self.device,
+        out = await dispatch_inpainting(config.inpainter.inpainter, ctx.img_rgb, ctx.mask, config.inpainter, config.inpainter.inpainting_size, self.device,
                                          self.verbose)
+        if config.inpainter.inpainter != Inpainter.none and out is not None:
+            fixed = restore_flat_backgrounds(ctx.img_rgb, ctx.mask, out, ctx.text_regions,
+                                             ctx.mask_raw)
+            if fixed:
+                logger.info(f'Restored flat background on {fixed} erased areas')
+        return out
 
     async def _run_text_rendering(self, config: Config, ctx: Context):
         current_time = time.time()

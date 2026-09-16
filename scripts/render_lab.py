@@ -93,11 +93,21 @@ def cmd_fixture(args) -> int:
         "text_regions": ctx.text_regions,
         # raw detections, so `merge` can replay textline_merge offline
         "textlines": getattr(ctx, "textlines", None),
+        # The mask is what inpainting erased. Without it, "the balloon turned
+        # into artwork" is indistinguishable from a rendering bug, and the two
+        # need opposite fixes.
+        "mask": None if getattr(ctx, "mask", None) is None else np.asarray(ctx.mask),
+        "mask_raw": None if getattr(ctx, "mask_raw", None) is None else np.asarray(ctx.mask_raw),
     }
     with out.open("wb") as fh:
         pickle.dump(fixture, fh)
     cv2.imwrite(str(LAB_DIR / f"{args.name}_inpainted.png"),
                 cv2.cvtColor(fixture["img_inpainted"], cv2.COLOR_RGB2BGR))
+    for key in ("mask", "mask_raw"):
+        if fixture[key] is not None:
+            cv2.imwrite(str(LAB_DIR / f"{args.name}_{key}.png"), fixture[key])
+            print(f"{key}: shape={fixture[key].shape} "
+                  f"coverage={(fixture[key] > 0).mean():.4f}")
     print(f"fixture saved {out}  regions={len(ctx.text_regions)}")
     for i, r in enumerate(ctx.text_regions):
         print(f"  #{i:2d} lines={_nlines(r)} font={r.font_size} "
@@ -399,6 +409,144 @@ def cmd_probe(args) -> int:
     return 0
 
 
+def cmd_mask(args) -> int:
+    """Replay mask refinement offline from the fixture.
+
+    The mask decides what inpainting erases, so "the balloon turned into
+    artwork" is a mask bug, not a rendering bug - but the only way to tell which
+    stage widened it is to run the stages separately on the same input.
+    """
+    import asyncio
+    from manga_translator import mask_refinement
+
+    with (LAB_DIR / f"{args.name}.pkl").open("rb") as fh:
+        fx = pickle.load(fh)
+    img_rgb = fx["img_rgb"]
+    raw = fx.get("mask_raw")
+    if raw is None:
+        print("fixture has no mask_raw; regenerate it with the current fixture cmd")
+        return 1
+    regions = fx["text_regions"]
+    print(f"mask_raw coverage={(raw > 0).mean():.4f}")
+
+    seeded = 0
+    seed_in = raw.copy()
+    if not args.no_seed:
+        seeded = mask_refinement.seed_unmasked_lines(seed_in, img_rgb, regions)
+    print(f"seeded lines={seeded}  after-seed coverage={(seed_in > 0).mean():.4f}")
+
+    # Stage-by-stage coverage inside one box. Guessing which stage widens the
+    # mask wasted two rounds (the CRF and the dilation were both innocent), so
+    # measure every step on the same pixels instead.
+    if args.box:
+        from manga_translator.mask_refinement.text_mask_utils import complete_mask
+        from manga_translator.utils import Quadrilateral
+        bx1, by1, bx2, by2 = (int(v) for v in args.box.split(","))
+
+        def cov(mm, scale=1.0):
+            a, b = int(bx1 * scale), int(by1 * scale)
+            c, d = int(bx2 * scale), int(by2 * scale)
+            return (mm[b:d, a:c] > 0).mean()
+
+        print(f"[stage] mask_raw                {cov(raw):.3f}")
+        print(f"[stage] after seeding           {cov(seed_in):.3f}")
+        sf = max(min((seed_in.shape[0] - img_rgb.shape[0] / 3) / seed_in.shape[0], 1), 0.5)
+        img_r = cv2.resize(img_rgb, (int(img_rgb.shape[1] * sf), int(img_rgb.shape[0] * sf)),
+                           interpolation=cv2.INTER_LINEAR)
+        mask_r = cv2.resize(seed_in, (int(img_rgb.shape[1] * sf), int(img_rgb.shape[0] * sf)),
+                            interpolation=cv2.INTER_LINEAR)
+        print(f"[stage] resized  (sf={sf:.3f})     {cov(mask_r, sf):.3f}   <- INTER_LINEAR")
+        mask_r[mask_r > 0] = 255
+        print(f"[stage] resized + threshold>0   {cov(mask_r, sf):.3f}")
+        tls = [Quadrilateral(l * sf, '', 0) for r in regions for l in r.lines]
+        fm = complete_mask(img_r, mask_r, tls, dilation_offset=args.dilation_offset,
+                           kernel_size=args.kernel_size)
+        print(f"[stage] complete_mask           {cov(fm, sf):.3f}")
+        fm2 = cv2.resize(fm, (img_rgb.shape[1], img_rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
+        fm2[fm2 > 0] = 255
+        print(f"[stage] upscaled + threshold>0  {cov(fm2):.3f}")
+
+    # complete_mask is the CRF + dilation step; call it the way dispatch does.
+    out = asyncio.get_event_loop().run_until_complete(
+        mask_refinement.dispatch(regions, img_rgb, seed_in, 'fit_text',
+                                 dilation_offset=args.dilation_offset,
+                                 kernel_size=args.kernel_size, verbose=False))
+    print(f"refined coverage={(out > 0).mean():.4f}")
+    tag = args.tag or ("noseed" if args.no_seed else "seed")
+    cv2.imwrite(str(LAB_DIR / f"{args.name}_mask_{tag}.png"), out)
+
+    # Per-region growth is what matters: a balloon eaten whole shows up as a
+    # refined mask many times the area of the strokes it started from.
+    print(f"{'#':>3} {'box':>24} {'raw%':>6} {'seed%':>6} {'refined%':>9}  text")
+    for i, r in enumerate(regions):
+        pts = np.array(r.min_rect).reshape(-1, 2)
+        x1, y1 = int(pts[:, 0].min()), int(pts[:, 1].min())
+        x2, y2 = int(pts[:, 0].max()), int(pts[:, 1].max())
+        a = (raw[y1:y2, x1:x2] > 0).mean() if y2 > y1 and x2 > x1 else 0
+        b = (seed_in[y1:y2, x1:x2] > 0).mean() if y2 > y1 and x2 > x1 else 0
+        c = (out[y1:y2, x1:x2] > 0).mean() if y2 > y1 and x2 > x1 else 0
+        print(f"{i:>3} {str((x1, y1, x2, y2)):>24} {a:>6.3f} {b:>6.3f} {c:>9.3f}  "
+              f"{str(r.text)[:34]!r}")
+    return 0
+
+
+def cmd_flat(args) -> int:
+    """Replay restore_flat_backgrounds on the fixture and crop the result.
+
+    "fixed 6 areas" said nothing about the three balloons that stayed broken, and
+    this is judged by pixels anyway. Writes original | inpainted | restored side
+    by side for one box.
+    """
+    import logging
+
+    from manga_translator.inpainting import flat_bg
+    from manga_translator.inpainting.flat_bg import restore_flat_backgrounds
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    flat_bg.logger.setLevel(logging.DEBUG)
+    flat_bg.logger.addHandler(logging.StreamHandler(sys.stdout))
+
+    with (LAB_DIR / f"{args.name}.pkl").open("rb") as fh:
+        fx = pickle.load(fh)
+    img_rgb, mask, mask_raw = fx["img_rgb"], fx.get("mask"), fx.get("mask_raw")
+    if mask is None:
+        print("fixture has no mask; regenerate it")
+        return 1
+    before = fx["img_inpainted"].copy()
+    after = before.copy()
+    n = restore_flat_backgrounds(img_rgb, mask, after, fx["text_regions"], mask_raw)
+    print(f"repainted lines={n} changed_px={(after != before).any(axis=2).sum()}")
+
+    h, w = mask.shape[:2]
+    boxes = []
+    if args.box:
+        boxes.append(tuple(int(v) for v in args.box.split(",")))
+    for idx in [int(v) for v in args.regions.split(",")] if args.regions else []:
+        pts = np.array(fx["text_regions"][idx].lines).reshape(-1, 2)
+        pad = 40
+        boxes.append((max(0, int(pts[:, 0].min()) - pad), max(0, int(pts[:, 1].min()) - pad),
+                      min(w, int(pts[:, 0].max()) + pad), min(h, int(pts[:, 1].max()) + pad)))
+
+    rows = []
+    for x1, y1, x2, y2 in boxes:
+        # The mask panel is what makes the others readable: "the balloon is white
+        # here" means nothing until you can see whether that pixel was erased.
+        mask_pan = cv2.cvtColor(((mask[y1:y2, x1:x2] > 0) * 255).astype(np.uint8),
+                                cv2.COLOR_GRAY2RGB)
+        sep = np.full((y2 - y1, 6, 3), 255, np.uint8)
+        row = img_rgb[y1:y2, x1:x2]
+        for pan in (mask_pan, before[y1:y2, x1:x2], after[y1:y2, x1:x2]):
+            row = np.hstack([row, sep, pan])
+        rows.append(row)
+    width = max(r.shape[1] for r in rows)
+    sheet = np.vstack([np.pad(r, ((0, 0), (0, width - r.shape[1]), (0, 0)),
+                              constant_values=255) for r in rows])
+    out = LAB_DIR / f"{args.name}_flat.png"
+    cv2.imwrite(str(out), cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR))
+    print(f"wrote {out} rows={len(rows)}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -429,6 +577,22 @@ def main() -> int:
     f.add_argument("--box-th", type=float, default=0.4)
     f.add_argument("--unclip", type=float, default=2.8)
     f.set_defaults(func=cmd_fixture)
+
+    k = sub.add_parser("mask")
+    k.add_argument("--name", required=True)
+    k.add_argument("--no-seed", action="store_true",
+                   help="skip seed_unmasked_lines, to tell whether seeding is the cause")
+    k.add_argument("--dilation-offset", type=int, default=0)
+    k.add_argument("--kernel-size", type=int, default=3)
+    k.add_argument("--box", default="", help="x1,y1,x2,y2 to get per-stage coverage")
+    k.add_argument("--tag", default="")
+    k.set_defaults(func=cmd_mask)
+
+    fl = sub.add_parser("flat")
+    fl.add_argument("--name", required=True)
+    fl.add_argument("--box", default="", help="x1,y1,x2,y2")
+    fl.add_argument("--regions", default="", help="region indices, e.g. 4,11,12")
+    fl.set_defaults(func=cmd_flat)
 
     r = sub.add_parser("render")
     r.add_argument("--name", required=True)

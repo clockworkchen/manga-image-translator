@@ -53,6 +53,42 @@ def seed_unmasked_lines(raw_mask: np.ndarray, raw_image: np.ndarray,
             seeded += 1
     return seeded
 
+def clip_mask_to_lines(final_mask: np.ndarray, text_regions: List[TextBlock]) -> np.ndarray:
+    """Drop mask that lies outside the recognized text lines.
+
+    Mask components are grown from connected pixels, so once a glyph's mask
+    touches the balloon outline - which it does on a small balloon, where the
+    lettering nearly reaches the edge and everything gets dilated - the outline
+    becomes part of the same component and is erased with the text. The balloon
+    then comes back as an outline-less blob, or with a bite taken out of it.
+
+    Nothing outside a text line needs erasing by definition, so clipping to the
+    lines bounds the damage to the balloon while still erasing all of the text.
+
+    The margin only has to cover the antialiased edge of the glyphs and a little
+    slack between the line box the recognizer reported and the actual strokes, so
+    it is kept to a few pixels. A generous margin (0.35 of the font size, which
+    was the first attempt) is itself enough to reach the outline of a small
+    balloon, which defeats the point of clipping at all.
+    """
+    keep = np.zeros_like(final_mask)
+    any_line = False
+    for region in text_regions:
+        lines = getattr(region, 'lines', None)
+        if lines is None:
+            continue
+        margin = max(3, int(round(float(getattr(region, 'font_size', 0) or 0) * 0.15)))
+        for line in lines:
+            pts = np.array(line).reshape(-1, 2).astype(np.int32)
+            x1, y1 = pts[:, 0].min() - margin, pts[:, 1].min() - margin
+            x2, y2 = pts[:, 0].max() + margin, pts[:, 1].max() + margin
+            cv2.rectangle(keep, (int(x1), int(y1)), (int(x2), int(y2)), 255, -1)
+            any_line = True
+    if not any_line:
+        return final_mask
+    return cv2.bitwise_and(final_mask, keep)
+
+
 async def dispatch(text_regions: List[TextBlock], raw_image: np.ndarray, raw_mask: np.ndarray, method: str = 'fit_text', dilation_offset: int = 0, ignore_bubble: int = 0, verbose: bool = False,kernel_size:int=3) -> np.ndarray:
     raw_mask = raw_mask.copy()   # seeding must not mutate the caller's mask_raw
     seed_unmasked_lines(raw_mask, raw_image, text_regions)
@@ -77,6 +113,7 @@ async def dispatch(text_regions: List[TextBlock], raw_image: np.ndarray, raw_mas
     else:
         final_mask = cv2.resize(final_mask, (raw_image.shape[1], raw_image.shape[0]), interpolation = cv2.INTER_LINEAR)
         final_mask[final_mask > 0] = 255
+        final_mask = clip_mask_to_lines(final_mask, text_regions)
 
     if ignore_bubble < 1 or ignore_bubble > 50:
         return final_mask

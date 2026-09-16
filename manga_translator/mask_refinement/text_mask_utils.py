@@ -93,7 +93,7 @@ def refine_mask(rgbimg, rawmask):
     crf_mask = np.array(res * 255, dtype=np.uint8)
     return crf_mask
 
-def complete_mask(img: np.ndarray, mask: np.ndarray, textlines: List[Quadrilateral], keep_threshold = 1e-2, dilation_offset = 0,kernel_size=3):
+def complete_mask(img: np.ndarray, mask: np.ndarray, textlines: List[Quadrilateral], keep_threshold = 1e-2, dilation_offset = 0,kernel_size=3, max_crf_growth = 1.25):
     bboxes = [txtln.aabb.xywh for txtln in textlines]
     polys = [Polygon(txtln.pts) for txtln in textlines]
     for (x, y, w, h) in bboxes:
@@ -181,7 +181,18 @@ def complete_mask(img: np.ndarray, mask: np.ndarray, textlines: List[Quadrilater
         # cv2.imshow('cc before', image_resize(cc_region, height = 800))
         img_region = np.ascontiguousarray(img[y1: y1 + h1, x1: x1 + w1])
         # cv2.imshow('img', image_resize(img_region, height = 800))
-        cc_region = refine_mask(img_region, cc_region)
+        seed_area = int((cc_region > 0).sum())
+        refined = refine_mask(img_region, cc_region)
+        # The CRF is here to recover antialiased glyph edges, which is a small
+        # addition. When it instead spreads across the flat area between the
+        # glyphs, keep the seed: inside a speech balloon that result is the whole
+        # balloon interior, and the inpainter then rebuilds the balloon from the
+        # artwork around it, so the balloon disappears from the page. Two
+        # balloons on the reference page were lost this way - measured on one of
+        # them, the CRF took the mask from 63% of the line box to 93%.
+        refined_area = int((refined > 0).sum())
+        if seed_area > 0 and refined_area <= seed_area * max_crf_growth:
+            cc_region = refined
         # cv2.imshow('cc after', image_resize(cc_region, height = 800))
         # cv2.waitKey(0)
         cc[y1: y1 + h1, x1: x1 + w1] = cc_region
