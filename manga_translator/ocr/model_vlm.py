@@ -100,6 +100,9 @@ class ModelVlmOCR(CommonOCR):
         if not base or not model:
             self.logger.warning("vlm ocr: no API base/model configured, using 48px_ctc")
             return await self._run_fallback(image, textlines, config, verbose)
+        source = "request" if config.vlm_model else (
+            "VLM_OCR env" if os.environ.get("VLM_OCR_MODEL") else "CUSTOM_OPENAI env")
+        self.logger.info("vlm ocr: model=%s source=%s", model, source)
 
         # Read at BUBBLE level, not per detection box. Detector boxes overlap and
         # under-cover multi-line text, so a per-box crop shows fragments of its
