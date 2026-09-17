@@ -800,7 +800,10 @@ class MangaTranslator:
             ctx.textlines = filtered_textlines  
     
         text_regions = await dispatch_textline_merge(ctx.textlines, ctx.img_rgb.shape[1], ctx.img_rgb.shape[0],  
-                                                     verbose=self.verbose)  
+                                                     verbose=self.verbose)
+        if config.render.overflow_strategy == 'bubble':
+            from .textline_merge import merge_closed_bubble_regions
+            text_regions = merge_closed_bubble_regions(text_regions, ctx.img_rgb)
 
         new_text_regions = []
         for region in text_regions:

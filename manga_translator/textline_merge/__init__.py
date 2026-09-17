@@ -189,6 +189,57 @@ def merge_bboxes_text_region(bboxes: List[Quadrilateral], width, height,
         # yield overall bbox and sorted indices
         yield txtlns, (fg_r, fg_g, fg_b), (bg_r, bg_g, bg_b)
 
+def merge_closed_bubble_regions(regions, image):
+    """Join near-equal stacked text blocks only inside one closed comic balloon.
+
+    Called before translation, exclusively in bubble mode. Preserve distinct
+    shouting/body sizes, columns, rotations and uncertain/open backgrounds.
+    """
+    from ..rendering import _bubble_groups, _aabb_of
+
+    boxes = [_aabb_of(region.min_rect) for region in regions]
+    groups = _bubble_groups(image, boxes)
+    replacements, removed = {}, set()
+    for group in set(groups):
+        members = [i for i, value in enumerate(groups) if value == group]
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda i: boxes[i][1])
+        ordered = [regions[i] for i in members]
+        sizes = [float(region.font_size) for region in ordered]
+        if min(sizes) <= 0 or max(sizes) / min(sizes) > 1.15:
+            continue
+        if any(abs(region.angle) > 3 or len(region.lines) != len(region.texts)
+               for region in ordered):
+            continue
+        connected = True
+        for a, b in zip(members, members[1:]):
+            ax1, ay1, ax2, ay2 = boxes[a]
+            bx1, by1, bx2, by2 = boxes[b]
+            overlap = min(ax2, bx2) - max(ax1, bx1)
+            gap = by1 - ay2
+            if (overlap < 0.5 * min(ax2 - ax1, bx2 - bx1)
+                    or gap < -1 or gap > 1.5 * max(sizes)):
+                connected = False
+                break
+        if not connected:
+            continue
+        entries = [(line, text) for region in ordered
+                   for line, text in zip(region.lines, region.texts)]
+        entries.sort(key=lambda item: float(np.asarray(item[0])[:, 1].mean()))
+        merged = TextBlock(
+            [item[0] for item in entries], [item[1] for item in entries],
+            font_size=float(np.median(sizes)), angle=0,
+            prob=min(region.prob for region in ordered),
+            fg_color=np.median([region.get_font_colors()[0] for region in ordered], axis=0),
+            bg_color=np.median([region.get_font_colors()[1] for region in ordered], axis=0))
+        merged.text_raw = merged.text
+        first = min(members)
+        replacements[first] = merged
+        removed.update(i for i in members if i != first)
+    return [replacements.get(i, region) for i, region in enumerate(regions) if i not in removed]
+
+
 async def dispatch(textlines: List[Quadrilateral], width: int, height: int, verbose: bool = False,
                    merge_opts: dict = None) -> List[TextBlock]:
     # print(width, height)
