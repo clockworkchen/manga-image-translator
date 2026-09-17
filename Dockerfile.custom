@@ -4,6 +4,8 @@
 # Pinned digest of the locally inspected official image; no backup stage/assets.
 FROM zyddnys/manga-image-translator@sha256:261c2d7ee114d9105e11210d6abc31c0552ac91f0cd65a8ef47db9eb345106d8
 
+ARG SOURCE_REV=unknown
+LABEL org.opencontainers.image.revision=$SOURCE_REV
 WORKDIR /app
 ENV PYTHONPATH="/app" \
     PYTHONDONTWRITEBYTECODE=1 \
