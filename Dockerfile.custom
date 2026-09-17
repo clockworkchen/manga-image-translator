@@ -1,29 +1,56 @@
-# Custom build: overlay patched source onto the existing image (which already has models)
-# Usage: docker build -f Dockerfile.custom -t manga-translator-custom:latest .
-#
-# Base image: the backup we saved from the running container (includes models + deps)
-FROM manga-translator-patched:backup-20260613
+# syntax=docker/dockerfile:1
+# Candidate only: build + security/translation validation are required before push.
+# Never use a service-container snapshot, docker commit, or backup image here.
+# Pinned digest of the locally inspected official image; no backup stage/assets.
+FROM zyddnys/manga-image-translator@sha256:261c2d7ee114d9105e11210d6abc31c0552ac91f0cd65a8ef47db9eb345106d8
 
-# Copy our patched source code (overrides the original /app files)
+WORKDIR /app
+ENV PYTHONPATH="/app" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    MT_EXTRA_PACKAGES=""
+
+# Install additional dependencies at BUILD time, never from deployment secrets.
+# PaddleOCR 2.7.3 requires OpenCV <=4.6.0.66; newer headless wheels can force
+# NumPy 2.x and overwrite the shared cv2 namespace. Keep ALL providers aligned.
+# Do not reinstall requirements.txt: the pinned base already supplies MT/Torch.
+# The base's ninja wheel fails pip check on this platform: replace that wheel.
+RUN python -m pip install --no-cache-dir --force-reinstall --no-deps ninja==1.11.1.3 \
+    && python -m pip install --no-cache-dir \
+        numpy==1.26.4 \
+        paddlepaddle==2.6.2 paddleocr==2.7.3 \
+        opencv-python==4.6.0.66 \
+        opencv-contrib-python==4.6.0.66 \
+        opencv-python-headless==4.6.0.66 \
+        pdf2docx==0.5.13 PyMuPDF==1.27.2.3 \
+    && python -m pip check
+
+# Local input is restricted by the deny-by-default .dockerignore. In particular,
+# never COPY . /app, models/, fonts/, runtime output, credentials or host caches.
+# Official models/fonts are already present; backup model hashes were identical.
 COPY manga_translator/ /app/manga_translator/
-
-# Copy JSON proxy and startup script (baked in, no runtime injection needed)
 COPY json_proxy.py /app/json_proxy.py
 COPY docker_start.sh /app/docker_start.sh
-
-# Also copy any updated root-level files
 COPY requirements.txt /app/requirements.txt
 COPY docker_prepare.py /app/docker_prepare.py
 
-# Clear stale bytecode caches, fix line endings (Windows CRLF → LF), make executable
-RUN find /app -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null; \
-    find /app -name '*.pyc' -delete 2>/dev/null; \
-    sed -i 's/\r//' /app/docker_start.sh && chmod +x /app/docker_start.sh; \
-    echo "Build complete"
+# Build-time formatting only; never patch Python sources in a startup script.
+RUN python -c "from pathlib import Path; p=Path('/app/docker_start.sh'); p.write_bytes(p.read_bytes().replace(b'\r\n', b'\n')); p.chmod(0o755)" \
+    && bash -n /app/docker_start.sh \
+    && python -m compileall -q /app/manga_translator /app/json_proxy.py /app/docker_prepare.py \
+    && find /app/manga_translator /app/__pycache__ -name '*.pyc' -delete \
+    && python -c "import numpy, cv2, paddle; import manga_translator; import json_proxy; assert numpy.__version__ == '1.26.4'; assert cv2.__version__ == '4.6.0'"
 
-ENV PYTHONPATH="/app"
-WORKDIR /app
+# Download/init the default Chinese Paddle detector/recognizer at build time.
+# This performs no translation and uses no user images/API keys. Fail the build
+# on missing models instead of relying on first-start downloads. Other optional
+# engines/languages may still require their own explicit model preparation.
+RUN python -c "from manga_translator.utils.paddle_engine import get_paddle_engine; get_paddle_engine(lang='ch', use_gpu=False)"
 
-# Override base image ENTRYPOINT and set CMD to our startup script
+EXPOSE 5003
 ENTRYPOINT []
-CMD ["bash", "/app/docker_start.sh"]
+# The source starter still supports legacy startup pip. Unset its trigger even
+# if a deployment inherited MT_EXTRA_PACKAGES. Do not override this CMD with
+# 'bash /app/docker_start.sh'; bake any future dependency into the image instead.
+CMD ["env", "-u", "MT_EXTRA_PACKAGES", "bash", "/app/docker_start.sh"]

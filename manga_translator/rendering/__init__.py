@@ -1,4 +1,5 @@
 import os
+import re
 import cv2
 import numpy as np
 from typing import List
@@ -240,7 +241,7 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
         #           "shrink" = no expansion, shrink font to fit in original lines
         img_h, img_w = img.shape[:2]
         
-        if overflow_strategy in ("cascade", "auto") and dst_points is not None:
+        if overflow_strategy in ("cascade", "auto", "bubble") and dst_points is not None:
             # Step 1: Check if expanded dst_points fits within image
             pts = dst_points.reshape(-1, 2) if dst_points.ndim > 2 else dst_points
             min_x, max_x = float(pts[:, 0].min()), float(pts[:, 0].max())
@@ -739,6 +740,7 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
 
     img_h, img_w = img.shape[:2]
     margin = 4
+    bubble_mode = strategy == "bubble"
     boxes = [_aabb_of(r.min_rect) for r in text_regions]
 
     # Per-line height basis = the ACTUAL original ink height (more faithful than
@@ -760,9 +762,11 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
     # the left+right columns of a spec line) must start at the SAME y so their
     # tops align. Anchor each region to the topmost detection box in its row.
     row_top = {}
+    row_mates = {}
     for i in h_idxs:
         yi1, yi2 = boxes[i][1], boxes[i][3]
         tops = [yi1]
+        mates = 0
         for j in h_idxs:
             if j == i:
                 continue
@@ -770,7 +774,9 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
             ov = min(yi2, yj2) - max(yi1, yj1)
             if ov > 0.5 * min(yi2 - yi1, yj2 - yj1):
                 tops.append(yj1)
+                mates += 1
         row_top[i] = min(tops)
+        row_mates[i] = mates
 
     for i, region in enumerate(text_regions):
         if not getattr(region, "horizontal", False) or not region.translation:
@@ -789,8 +795,25 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
 
         # ── Available bounds via midpoints to nearest neighbours ──
         L, R, T, B = float(margin), float(img_w - margin), float(margin), float(img_h - margin)
+        if bubble_mode:
+            # Comics: the hard bound is the ORIGINAL text's own footprint.
+            # The letterer fitted that text inside the balloon, so anything that
+            # fits in the same rectangle is inside the balloon too - a guarantee
+            # no bubble-outline detection can give. _estimate_bubble_bounds is
+            # skipped here for exactly that reason: its flood fill leaks through
+            # balloon tails and hand-drawn gaps and then reports the whole panel,
+            # which is worse than no bound at all.
+            # The inset matters because CJK glyphs fill their em box while Latin
+            # ones carry side bearings: rendering CJK at the measured Latin ink
+            # width puts ink where the original had whitespace, right on the
+            # outline.
+            inset = max(1.0, h_i * 0.12)
+            L, R = x1 + inset, x2 - inset
+            T, B = float(y1), float(y2)
+            if R - L < h_i * 1.5:      # tiny balloon: keep it usable
+                L, R = float(x1), float(x2)
         for j, ob in enumerate(boxes):
-            if j == i:
+            if j == i or bubble_mode:
                 continue
             ox1, oy1, ox2, oy2 = ob
             v_ov = min(y2, oy2) - max(y1, oy1)        # vertical overlap (same row?)
@@ -816,6 +839,11 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
         # may shrink as a last resort.
         if strategy in ("wrap", "expand_wrap"):
             min_per_line = per_line   # never shrink font
+        elif bubble_mode:
+            # Fitting inside the balloon outranks size fidelity here: a balloon has
+            # no free space to grow into, so shrinking is the only way out and
+            # max_font_shrink_ratio must not stop it short of fitting.
+            min_per_line = max(float(font_size_minimum), 6.0)
         else:
             min_per_line = max(per_line * max_font_shrink_ratio, font_size_minimum, 6)
         target_lang = getattr(region, "target_lang", "en_US")
@@ -841,7 +869,8 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
         # Bubble bound (comics): a speech bubble usually has NO neighbour in its
         # row, so R-L below is almost the whole image width. Clamp to the bubble
         # when one is found; returns None on product images, leaving them as-is.
-        bubble = _estimate_bubble_bounds(original_img, [x1, y1, x2, y2], h_i)
+        bubble = None if bubble_mode else _estimate_bubble_bounds(
+            original_img, [x1, y1, x2, y2], h_i)
         if bubble:
             pad = max(2.0, per_line * 0.25)
             L = max(L, bubble[0] + pad)
@@ -871,16 +900,23 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
             # only when the text genuinely does not fit in orig_lines lines,
             # which is what product images (longer target text) need.
             wrap_target = min(orig_w, avail_w)
+            # Cap the widening. Without a cap this grows to `avail_w`, which on a
+            # comic page is most of the image: a balloon has no neighbouring
+            # column, so the neighbour-derived bound says "the whole row is free"
+            # and a long line is preferred over an extra line. The line then runs
+            # straight out through the sides of the balloon. Doubling the original
+            # footprint is enough for the longer-target case product images need.
+            widen_limit = wrap_target if bubble_mode else min(avail_w, orig_w * 2.0)
             f0 = max(int(round(per_line)), 6)
             guard = 0
-            while wrap_target < avail_w - 1 and guard < 12:
+            while wrap_target < widen_limit - 1 and guard < 12:
                 guard += 1
                 probe_lines, _ = text_render.calc_horizontal(
                     f0, region.translation, max(int(wrap_target), 2 * f0),
                     int(max(avail_h, per_line * 12)), language=target_lang)
                 if len(probe_lines) <= orig_lines:
                     break
-                wrap_target = min(avail_w, wrap_target * 1.25)
+                wrap_target = min(widen_limit, wrap_target * 1.25)
 
         # Cascade: keep original per-line height; wrap within the target width
         # (EXPAND bounded by neighbours -> WRAP). Only if the wrapped block is
@@ -896,12 +932,15 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
             n = max(len(lines), 1)
             maxw = max(widths) if widths else wrap_w
             box_h = plh * n
-            box_w = min(maxw, avail_w)
-            # Never shrink box below the original detection width: a short
-            # translation (e.g. 4 CJK chars replacing 17 Latin chars) should
-            # be rendered centered/left-aligned inside the original space,
-            # not squeezed into a tiny box.
-            box_w = max(box_w, min(orig_w, avail_w))
+            # The box width IS the wrap width at render time (render() passes the
+            # box width to put_text_horizontal), so it must not exceed the width
+            # these n lines were measured at. Widening it back to the original
+            # detection width - which is what used to happen - made render() wrap
+            # the text again on a wider canvas and produce FEWER lines than n,
+            # and those few lines were then stretched to fill an n-line-tall box:
+            # a three-line balloon came out as two oversized lines running past
+            # the balloon outline.
+            box_w = min(max(maxw, 2.0 * f), wrap_w, avail_w)
             chosen = (f, box_w, box_h, n)
             if box_h <= avail_h or plh <= min_per_line:
                 break
@@ -926,6 +965,14 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
             nx1, nx2 = bxc - half, bxc + half
         # Vertical: anchor top to the ROW's common top (same-row columns align).
         ny1 = max(T, row_top.get(i, y1))
+        # A standalone block that came out shorter than the original (the
+        # translation needed fewer lines) is centred in the original footprint
+        # instead. Balloons are rounded, so top-anchoring a short block puts it
+        # where the balloon is narrowest and the line ends poke through the
+        # outline; the vertical middle is the widest part. Regions that share a
+        # row keep the common top - that alignment is the point on product images.
+        if (bubble_mode or row_mates.get(i, 0) == 0) and box_h < (y2 - y1) - 1:
+            ny1 = max(T, y1 + ((y2 - y1) - box_h) / 2.0)
         if ny1 + box_h > B:
             ny1 = max(T, B - box_h)
         ny2 = ny1 + box_h
@@ -935,6 +982,245 @@ def _fit_regions_cascade(img, text_regions, dst_points_list, font_size_minimum, 
         ).reshape(-1, 4, 2)
 
     return dst_points_list
+
+def _bubble_ink_runs(mask):
+    """Visible row runs; an estimate, not OCR ground truth (touching lines merge)."""
+    rows = np.any(mask > 32, axis=1)
+    edges = np.diff(np.pad(rows.astype(np.int8), (1, 1)))
+    return (np.flatnonzero(edges == -1) - np.flatnonzero(edges == 1)).tolist()
+
+
+def _bubble_groups(original_img, boxes):
+    """Conservative closed light/dark interiors, used ONLY for grouping.
+
+    No dilation/closing that could bridge an outline. Components touching the
+    page edge or occupying >20% of it are rejected; uncertain blocks stay solo.
+    This is not balloon polygon extraction, and NEVER enlarges a text footprint.
+    """
+    groups = list(range(len(boxes)))
+    if original_img is None:
+        return groups
+    gray = original_img if original_img.ndim == 2 else cv2.cvtColor(original_img, cv2.COLOR_RGB2GRAY)
+    height, width = gray.shape
+    assigned = {}
+    for polarity, background in enumerate((gray >= 220, gray <= 35)):
+        _, labels, stats, _ = cv2.connectedComponentsWithStats(background.astype(np.uint8), connectivity=4)
+        for i, (x1, y1, x2, y2) in enumerate(boxes):
+            if i in assigned:
+                continue
+            crop = labels[max(0, int(y1)):min(height, int(np.ceil(y2))),
+                          max(0, int(x1)):min(width, int(np.ceil(x2)))]
+            if not crop.size:
+                continue
+            ids, counts = np.unique(crop, return_counts=True)
+            candidates = [(int(count), int(label)) for label, count in zip(ids, counts) if label]
+            if not candidates:
+                continue
+            count, label = max(candidates)
+            x, y, w, h, area = stats[label]
+            if (count < crop.size * 0.30 or x <= 0 or y <= 0 or
+                    x + w >= width or y + h >= height or area > width * height * 0.20):
+                continue
+            if x > x1 or y > y1 or x + w < x2 or y + h < y2:
+                continue
+            assigned[i] = (polarity, label)
+    first = {}
+    for i, key in assigned.items():
+        groups[i] = first.setdefault(key, i)
+    return groups
+
+
+def _bubble_balanced_lines(text, requested, font):
+    """Split at words/CJK characters, never at Latin letters or empty lines.
+
+    Explicit lines bypass calc_horizontal's 2-em minimum, which otherwise makes
+    e.g. four CJK characters unable to occupy four real lines at ANY font size.
+    Punctuation-only tokens attach to the preceding unit rather than forming a
+    line of their own. This is a modest tokenizer, not full Unicode line breaking.
+    """
+    cjk = '\\u3400-\\u9fff\\u3040-\\u30ff\\uac00-\\ud7af'
+    matches = list(re.finditer('[' + cjk + ']|[^\\s' + cjk + ']+', text))
+    starts = [m.start() for m in matches if any(c.isalnum() for c in m.group())]
+    if len(starts) < 2:
+        return None
+    starts[0] = 0  # retain any leading punctuation
+    count = min(requested, len(starts))
+    if count < 2:
+        return None
+    starts.append(len(text))
+    units = [text[starts[i]:starts[i + 1]] for i in range(len(starts) - 1)]
+    weights = [max(1, text_render.get_string_width(font, unit)) for unit in units]
+    lines, begin = [], 0
+    for remaining in range(count, 1, -1):
+        target = sum(weights[begin:]) / remaining
+        total, end = 0, begin
+        # Leave >=1 real unit for every remaining line.
+        limit = len(units) - remaining + 1
+        while end < limit:
+            next_total = total + weights[end]
+            if end > begin and abs(total - target) <= abs(next_total - target):
+                break
+            total = next_total
+            end += 1
+        end = max(begin + 1, end)
+        lines.append(''.join(units[begin:end]).strip())
+        begin = end
+    lines.append(''.join(units[begin:]).strip())
+    return tuple(line for line in lines if line)
+
+
+def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing, disable_font_border):
+    """Comic-only raster fitting inside each ORIGINAL axis-aligned footprint.
+
+    Select real nonempty lines, then measure the rendered alpha rather than
+    stretching an n*font-size box. No product-page median, row-top or expansion.
+    Line retention is best-effort: legal wrapping, finite width probes and the
+    source-line estimate limit it; never insert blank lines to meet a quota.
+    """
+    boxes = [_aabb_of(r.min_rect) for r in text_regions]
+    groups = _bubble_groups(original_img, boxes)
+    heights, original_counts = {}, {}
+    for i, region in enumerate(text_regions):
+        box = boxes[i]
+        heights[i] = max(1.0, _per_line_height(region, box, original_img) / 1.1)
+        count = _orig_line_count(region)
+        if not region.horizontal:
+            # Vertical source size is ink COLUMN width, not row height.
+            measured = _measure_ink_height(
+                np.swapaxes(original_img, 0, 1) if original_img is not None else None,
+                [box[1], box[0], box[3], box[2]])
+            heights[i] = max(1.0, min(measured if measured > 0 else float('inf'),
+                                     (box[2] - box[0]) / count))
+        # A VLM may return one quad for several printed rows. Use separated ink
+        # runs as an additional estimate, not len(region.lines) alone.
+        if original_img is not None and region.horizontal:
+            x1, y1, x2, y2 = box
+            crop = original_img[max(0, int(y1)):max(0, int(y2)),
+                                max(0, int(x1)):max(0, int(x2))]
+            if crop.size:
+                gray = crop if crop.ndim == 2 else cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+                _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                if ink.mean() > 127:
+                    ink = 255 - ink
+                runs = _bubble_ink_runs(ink)
+                if runs:
+                    real = [run for run in runs if run >= max(3, max(runs) * 0.4)]
+                    count = max(count, len(real))
+        original_counts[i] = count
+
+    targets = heights.copy()
+    for group in set(groups):
+        members = [i for i, g in enumerate(groups) if g == group and text_regions[i].horizontal]
+        if len(members) < 2:
+            continue
+        median = float(np.median([heights[i] for i in members]))
+        # Only near-equal body sizes are snapped. Shouts/titles/small asides keep
+        # their relative size, even when they live in the very same balloon.
+        for i in members:
+            if median * 0.87 <= heights[i] <= median * 1.15:
+                targets[i] = min(median, heights[i] * 1.10)
+
+    plans = {}
+    for i, region in enumerate(text_regions):
+        x1, y1, x2, y2 = boxes[i]
+        inset = max(1.0, heights[i] * 0.12)
+        if x2 - x1 <= inset * 2 + 2:
+            inset = 0
+        left, top = max(0, int(np.ceil(x1 + inset))), max(0, int(np.ceil(y1)))
+        right, bottom = min(img.shape[1], int(np.floor(x2 - inset))), min(img.shape[0], int(np.floor(y2)))
+        avail_w, avail_h = right - left, bottom - top
+        region._orig_font_size = int(region.font_size)
+        region._bubble_group = int(groups[i])
+        region._bubble_original_lines = int(original_counts[i])
+        if avail_w < 1 or avail_h < 1:
+            continue
+        fg, bg = fg_bg_compare(*region.get_font_colors())
+        if disable_font_border:
+            bg = None
+        text = text_render.compact_special_symbols(region.get_translation_for_rendering())
+        if not text.strip():
+            continue
+        font = max(6, int(round(targets[i])))
+        best = None
+        if region.horizontal:
+            # Include narrow widths so SHORT translations can retain multiple
+            # lines. calc_horizontal has a 2-em minimum; fewer breakable units
+            # than source rows must fall back to fewer nonempty lines.
+            upper = max(2 * font, avail_w)
+            widths = sorted(set(int(round(w)) for w in np.linspace(2 * font, upper, 33)), reverse=True)
+            candidates = []
+            for width in widths:
+                lines, _ = text_render.calc_horizontal(font, text, width, avail_h,
+                                                       region.target_lang, hyphenate)
+                candidates.append(tuple(line for line in lines if line.strip()))
+            balanced = _bubble_balanced_lines(text, original_counts[i], font)
+            if balanced:
+                candidates.append(balanced)
+            seen = set()
+            for lines in candidates:
+                if not lines or lines in seen:
+                    continue
+                seen.add(lines)
+                raster = text_render.put_text_horizontal(
+                    font, text, avail_w, avail_h, region.alignment, region.direction == 'hl',
+                    fg, bg, region.target_lang, hyphenate, line_spacing, prewrapped_lines=lines)
+                if raster is None or not raster.size:
+                    continue
+                runs = _bubble_ink_runs(raster[:, :, 3])
+                visible = max(runs, default=raster.shape[0])
+                cap = min(targets[i], heights[i] * 1.10)
+                scale = min(cap / max(visible, 1), avail_w / raster.shape[1], avail_h / raster.shape[0])
+                # Hard containment and ink cap always win. Among feasible
+                # wraps prefer source row count, then largest readable scale.
+                retained = min(len(lines), original_counts[i])
+                score = (retained, scale, -abs(len(lines) - original_counts[i]))
+                if best is None or score > best[0]:
+                    best = (score, raster, scale, len(lines), visible)
+        else:
+            # Vertical text stays independent: no horizontal row normalization.
+            raster = text_render.put_text_vertical(font, text, max(font, avail_h),
+                                                   region.alignment, fg, bg, line_spacing)
+            if raster is not None and raster.size:
+                runs = _bubble_ink_runs(raster[:, :, 3].T)
+                visible = max(runs, default=raster.shape[1])
+                scale = min(heights[i] * 1.10 / max(visible, 1),
+                            avail_w / raster.shape[1], avail_h / raster.shape[0])
+                best = ((0, scale, 0), raster, scale, len(runs), visible)
+        if best is not None:
+            _, raster, scale, count, visible = best
+            plans[i] = (raster, scale, count, visible, (left, top, right, bottom), font)
+
+    # A constrained block scales the whole balloon uniformly, preserving the
+    # title/body hierarchy rather than making just one dialogue block tiny.
+    group_scales = {}
+    for i, (_, scale, _, visible, _, _) in plans.items():
+        if text_regions[i].horizontal:
+            ratio = scale * visible / targets[i]
+            group_scales[groups[i]] = min(group_scales.get(groups[i], 1.0), ratio)
+
+    points = []
+    for i, region in enumerate(text_regions):
+        region._bubble_raster = None
+        if i not in plans:
+            points.append(np.array(region.min_rect, copy=True))
+            continue
+        raster, scale, count, visible, bounds, font = plans[i]
+        if region.horizontal:
+            scale = min(scale, targets[i] * group_scales[groups[i]] / visible)
+        width = max(1, int(np.floor(raster.shape[1] * scale)))
+        height = max(1, int(np.floor(raster.shape[0] * scale)))
+        raster = cv2.resize(raster, (width, height), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+        left, top, right, bottom = bounds
+        x = left if region.alignment == 'left' else right - width if region.alignment == 'right' else left + (right - left - width) // 2
+        y = top + (bottom - top - height) // 2
+        region.font_size = font
+        region._render_lines = count
+        region._bubble_retained_lines = count >= original_counts[i] if region.horizontal else None
+        region._bubble_visible_ink_height = float(visible * scale)
+        region._bubble_raster = (raster, x, y)
+        points.append(np.array([[[x, y], [x + width, y], [x + width, y + height], [x, y + height]]], dtype=np.int64))
+    return points
+
 
 async def dispatch(
     img: np.ndarray,
@@ -955,8 +1241,16 @@ async def dispatch(
     text_render.set_font(font_path)
     text_regions = list(filter(lambda region: region.translation, text_regions))
 
-    # Resize regions that are too small (baseline; also sets vertical-text boxes)
-    dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum,
+    # Clear private raster state when callers reuse TextBlocks for another mode.
+    for region in text_regions:
+        region._bubble_raster = None
+    if overflow_strategy == "bubble":
+        # Completely separate from product-page median/row-top/overlap policies.
+        dst_points_list = _fit_regions_bubble(img, text_regions, original_img,
+                                              hyphenate, line_spacing, disable_font_border)
+    else:
+        # Resize baseline (also sets vertical-text boxes) for non-comic modes.
+        dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum,
                                                      overflow_strategy=overflow_strategy, max_font_shrink_ratio=max_font_shrink_ratio)
 
     if overflow_strategy in ("cascade", "auto", "wrap", "expand_wrap"):
@@ -969,7 +1263,7 @@ async def dispatch(
                                                font_size_minimum, max_font_shrink_ratio,
                                                original_img=original_img,
                                                strategy=overflow_strategy)
-    else:
+    elif overflow_strategy != "bubble":
         # Normalize uneven font sizes (product-image mode) so no line looks bold
         dst_points_list = _normalize_font_sizes(dst_points_list, text_regions)
         # Resolve overlapping text boxes to prevent text-on-text rendering
@@ -985,7 +1279,20 @@ async def dispatch(
         if render_mask is not None:
             # set render_mask to 1 for the region that is inside dst_points
             cv2.fillConvexPoly(render_mask, dst_points.astype(np.int32), 1)
-        img = render(img, region, dst_points, hyphenate, line_spacing, disable_font_border)
+        if overflow_strategy == "bubble":
+            prepared = region._bubble_raster
+            if prepared is not None:
+                raster, x, y = prepared
+                h, w = raster.shape[:2]
+                alpha = raster[:, :, 3:4].astype(np.float32) / 255.0
+                crop = img[y:y+h, x:x+w]
+                crop[:] = np.clip(crop.astype(np.float32) * (1 - alpha) +
+                                  raster[:, :, :3].astype(np.float32) * alpha, 0, 255).astype(np.uint8)
+            # Raster has already been fitted using visible ink. No second wrap
+            # or homography stretch back to a nominal n-line detection box.
+            region._bubble_raster = None
+        else:
+            img = render(img, region, dst_points, hyphenate, line_spacing, disable_font_border)
     return img
 
 def render(

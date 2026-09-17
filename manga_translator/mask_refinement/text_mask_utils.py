@@ -191,7 +191,7 @@ def complete_mask(img: np.ndarray, mask: np.ndarray, textlines: List[Quadrilater
         # balloons on the reference page were lost this way - measured on one of
         # them, the CRF took the mask from 63% of the line box to 93%.
         refined_area = int((refined > 0).sum())
-        if seed_area > 0 and refined_area <= seed_area * max_crf_growth:
+        if max_crf_growth is None or (seed_area > 0 and refined_area <= seed_area * max_crf_growth):
             cc_region = refined
         # cv2.imshow('cc after', image_resize(cc_region, height = 800))
         # cv2.waitKey(0)

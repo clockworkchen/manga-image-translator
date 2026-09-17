@@ -187,7 +187,11 @@ class CommonTranslator(InfererModule):
             # Translate
             _translations = await self._translate(*self.parse_language_codes(from_lang, to_lang, fatal=True), queries)
 
-            # Extend returned translations list to have the same size as queries
+            if getattr(self, '_STRICT_TRANSLATION_COUNT', False) and len(_translations) != len(queries):
+                raise InvalidServerResponse(
+                    f'{self.__class__.__name__}: expected {len(queries)} translations, received {len(_translations)}'
+                )
+            # Preserve legacy padding only for translators without a strict protocol.
             if len(_translations) < len(queries):
                 _translations.extend([''] * (len(queries) - len(_translations)))
             elif len(_translations) > len(queries):

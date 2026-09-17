@@ -1100,7 +1100,8 @@ def put_char_horizontal(font_size: int, cdpt: str, pen_l: Tuple[int, int], canva
 
 def put_text_horizontal(font_size: int, text: str, width: int, height: int, alignment: str,
                         reversed_direction: bool, fg: Tuple[int, int, int], bg: Tuple[int, int, int],
-                        lang: str = 'en_US', hyphenate: bool = True, line_spacing: int = 0):
+                        lang: str = 'en_US', hyphenate: bool = True, line_spacing: int = 0,
+                        prewrapped_lines: Optional[List[str]] = None):
     text = compact_special_symbols(text)
     if not text :
         return
@@ -1109,7 +1110,15 @@ def put_text_horizontal(font_size: int, text: str, width: int, height: int, alig
 
     # calc
     # print(width)
-    line_text_list, line_width_list = calc_horizontal(font_size, text, width, height, lang, hyphenate)
+    if prewrapped_lines is None:
+        line_text_list, line_width_list = calc_horizontal(font_size, text, width, height, lang, hyphenate)
+    else:
+        # Bubble layout has already selected nonempty lines using this font.
+        # Do not wrap again against the final (tight ink) destination width.
+        line_text_list = [line for line in prewrapped_lines if line.strip()]
+        if not line_text_list:
+            return np.zeros((0, 0, 4), dtype=np.uint8)
+        line_width_list = [get_string_width(font_size, line) for line in line_text_list]
     # print(line_text_list, line_width_list)
 
     # make large canvas

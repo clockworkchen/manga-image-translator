@@ -89,8 +89,14 @@ def clip_mask_to_lines(final_mask: np.ndarray, text_regions: List[TextBlock]) ->
     return cv2.bitwise_and(final_mask, keep)
 
 
-async def dispatch(text_regions: List[TextBlock], raw_image: np.ndarray, raw_mask: np.ndarray, method: str = 'fit_text', dilation_offset: int = 0, ignore_bubble: int = 0, verbose: bool = False,kernel_size:int=3) -> np.ndarray:
-    raw_mask = raw_mask.copy()   # seeding must not mutate the caller's mask_raw
+async def dispatch(text_regions: List[TextBlock], raw_image: np.ndarray, raw_mask: np.ndarray, method: str = 'fit_text', dilation_offset: int = 0, ignore_bubble: int = 0, verbose: bool = False,kernel_size:int=3, bubble_mode: bool = False) -> np.ndarray:
+    if raw_mask is None:
+        raw_mask = np.zeros(raw_image.shape[:2], dtype=np.uint8)
+    elif raw_mask.shape[:2] != raw_image.shape[:2]:
+        raw_mask = cv2.resize(raw_mask, (raw_image.shape[1], raw_image.shape[0]),
+                              interpolation=cv2.INTER_NEAREST)
+    else:
+        raw_mask = raw_mask.copy()   # seeding must not mutate the caller's mask_raw
     seed_unmasked_lines(raw_mask, raw_image, text_regions)
 
     # Larger sized mask images will probably have crisper and thinner mask segments due to being able to fit the text pixels better
@@ -107,13 +113,17 @@ async def dispatch(text_regions: List[TextBlock], raw_image: np.ndarray, raw_mas
             q = Quadrilateral(l * scale_factor, '', 0)
             textlines.append(q)
 
-    final_mask = complete_mask(img_resized, mask_resized, textlines, dilation_offset=dilation_offset,kernel_size=kernel_size) if method == 'fit_text' else complete_mask_fill([txtln.aabb.xywh for txtln in textlines])
+    final_mask = complete_mask(
+        img_resized, mask_resized, textlines, dilation_offset=dilation_offset,
+        kernel_size=kernel_size, max_crf_growth=1.25 if bubble_mode else None,
+    ) if method == 'fit_text' else complete_mask_fill([txtln.aabb.xywh for txtln in textlines])
     if final_mask is None:
         final_mask = np.zeros((raw_image.shape[0], raw_image.shape[1]), dtype = np.uint8)
     else:
         final_mask = cv2.resize(final_mask, (raw_image.shape[1], raw_image.shape[0]), interpolation = cv2.INTER_LINEAR)
         final_mask[final_mask > 0] = 255
-        final_mask = clip_mask_to_lines(final_mask, text_regions)
+        if bubble_mode:
+            final_mask = clip_mask_to_lines(final_mask, text_regions)
 
     if ignore_bubble < 1 or ignore_bubble > 50:
         return final_mask

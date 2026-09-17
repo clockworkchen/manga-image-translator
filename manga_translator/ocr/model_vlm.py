@@ -73,6 +73,10 @@ Answer with JSON only, no prose and no code fence:
 {{"lines": ["first line", "second line"]}}"""
 
 
+class VlmRequestBlocked(RuntimeError):
+    """Upstream safety/rate-limit refusal: never downgrade to local OCR."""
+
+
 class ModelVlmOCR(CommonOCR):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -106,20 +110,33 @@ class ModelVlmOCR(CommonOCR):
         # neighbour's dialogue. A crop per request has nothing to misalign.
         sem = asyncio.Semaphore(max(1, int(os.environ.get("VLM_OCR_CONCURRENCY", "6"))))
         failures = 0
+        blocked = asyncio.Event()
 
         async def one(rect):
             nonlocal failures
             async with sem:
+                if blocked.is_set():
+                    raise VlmRequestBlocked('VLM batch stopped after upstream refusal')
                 try:
                     return await self._ask(base, key, model,
                                            self._crop(image, rect),
                                            self._where(image, rect))
+                except VlmRequestBlocked:
+                    blocked.set()
+                    raise
                 except Exception as e:
                     failures += 1
                     self.logger.warning(f"vlm ocr: block failed ({e})")
                     return None
 
-        texts = await asyncio.gather(*(one(r) for r in blocks))
+        tasks = [asyncio.create_task(one(rect)) for rect in blocks]
+        try:
+            texts = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
         if failures >= max(1, len(blocks) // 2):
             self.logger.warning("vlm ocr: too many failures, falling back")
@@ -128,8 +145,20 @@ class ModelVlmOCR(CommonOCR):
         out: List[Quadrilateral] = []
         for rect, crop_text in zip(blocks, texts):
             if crop_text is None:
-                # This crop failed to parse. Skip it rather than invent a
-                # transcription; the box simply goes untranslated.
+                # A transport/parse failure is not evidence of an empty bubble.
+                # Never silently discard it while returning a successful page.
+                x1, y1, x2, y2 = rect
+                affected = []
+                for detected in textlines:
+                    pts = np.asarray(detected.pts).reshape(-1, 2)
+                    if (pts[:, 0].min() >= x1 and pts[:, 0].max() <= x2
+                            and pts[:, 1].min() >= y1 and pts[:, 1].max() <= y2):
+                        affected.append(detected)
+                recovered = await self._run_fallback(image, affected, config, verbose)
+                if not recovered:
+                    raise RuntimeError('VLM OCR block failed and fallback recovered no text')
+                self.logger.warning('vlm ocr: recovered failed block with local OCR; review required')
+                out.extend(recovered)
                 continue
             lines = [ln.strip() for ln in str(crop_text).splitlines() if ln.strip()]
             if not lines:
@@ -285,9 +314,20 @@ class ModelVlmOCR(CommonOCR):
                 headers=headers,
                 json={"model": model, "temperature": 0,
                       "messages": [{"role": "user", "content": content}]})
+        body = resp.text.lower()
+        if any(marker in body for marker in (
+                'safety_check_type_csam', 'content_policy_violation',
+                'content violates usage guidelines', 'content_moderated',
+                'content_filter', 'safety_violation')):
+            raise VlmRequestBlocked('upstream_safety_refusal: no OCR fallback permitted')
+        if resp.status_code == 429 or 'model_cooldown' in body:
+            raise VlmRequestBlocked('upstream_rate_limited: stop batch and respect cooldown')
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
-        return self._parse(resp.json()["choices"][0]["message"]["content"])
+        choice = resp.json()["choices"][0]
+        if choice.get('finish_reason') == 'content_filter' or choice['message'].get('refusal'):
+            raise VlmRequestBlocked('upstream_safety_refusal: no OCR fallback permitted')
+        return self._parse(choice["message"]["content"])
 
     @staticmethod
     def _parse(answer: str) -> Optional[str]:

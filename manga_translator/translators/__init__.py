@@ -156,6 +156,11 @@ async def dispatch_batch(chain: TranslatorChain, batch_queries: List[List[str]],
     # 使用现有的翻译调度器处理平铺的查询列表
     flat_results = await dispatch(chain, flat_queries, translator_config, use_mtpe, args, device)
     
+    # Never let zip silently discard missing/extra regions across image batches.
+    if len(flat_results) != len(query_mapping):
+        raise InvalidServerResponse(
+            f'batch translation: expected {len(query_mapping)} regions, received {len(flat_results)}'
+        )
     # 将结果重新分组回批量结构
     batch_results = [[] for _ in batch_queries]
     for result, batch_idx in zip(flat_results, query_mapping):

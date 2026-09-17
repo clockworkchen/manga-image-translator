@@ -91,14 +91,14 @@ def restore_flat_backgrounds(img_rgb: np.ndarray, mask: np.ndarray,
         return 0
     h, w = erased.shape[:2]
 
-    # Segment the strokes here rather than relying on the detector's mask: by the
-    # time inpainting runs, `ctx.mask_raw` is None, so depending on it meant the
-    # glyph rescue below and the colour sampling silently ran in their degraded
-    # form on every real page - the letters leaning on a balloon outline stayed on
-    # the page, while an offline replay with the mask present looked correct.
+    # Always seed missing strokes. Older deployed callers omitted mask_raw when
+    # invoking this helper (the context itself may still contain it), making live
+    # results differ from replay. Stroke seeding must work with either caller.
     strokes = np.zeros((h, w), np.uint8)
     seed_unmasked_lines(strokes, img_rgb, text_regions)
     if mask_raw is not None:
+        if mask_raw.shape[:2] != (h, w):
+            mask_raw = cv2.resize(mask_raw, (w, h), interpolation=cv2.INTER_NEAREST)
         strokes |= (mask_raw > 0).astype(np.uint8) * 255
     strokes = strokes > 0
     k3 = np.ones((3, 3), np.uint8)
@@ -159,12 +159,16 @@ def restore_flat_backgrounds(img_rgb: np.ndarray, mask: np.ndarray,
         for label in range(1, num_d):
             x, y = stats_d[label, cv2.CC_STAT_LEFT], stats_d[label, cv2.CC_STAT_TOP]
             bw, bh = stats_d[label, cv2.CC_STAT_WIDTH], stats_d[label, cv2.CC_STAT_HEIGHT]
-            sub = (labels_d[y:y + bh, x:x + bw] == label).astype(np.uint8)
+            # Include a one-pixel halo: dilating inside the tight component bbox
+            # clips the outside neighbours and misclassifies boundary contacts.
+            x0, y0 = max(0, x - 1), max(0, y - 1)
+            x2, y2 = min(labels.shape[1], x + bw + 1), min(labels.shape[0], y + bh + 1)
+            sub = (labels_d[y0:y2, x0:x2] == label).astype(np.uint8)
             ring = (cv2.dilate(sub, k3) > 0) & (sub == 0)
-            if outside[y:y + bh, x:x + bw][ring].any():
+            if outside[y0:y2, x0:x2][ring].any():
                 continue
-            if interior[y:y + bh, x:x + bw][ring].any():
-                paint[y:y + bh, x:x + bw] |= sub > 0
+            if interior[y0:y2, x0:x2][ring].any():
+                paint[y0:y2, x0:x2] |= sub > 0
 
         # Letters that touch the outline are one component with it - and with the
         # artwork beyond it, once the outline is crossed (measured on "WELL, LET'S

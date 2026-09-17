@@ -1354,14 +1354,18 @@ class MangaTranslator:
 
     async def _run_mask_refinement(self, config: Config, ctx: Context):
         return await dispatch_mask_refinement(ctx.text_regions, ctx.img_rgb, ctx.mask_raw, 'fit_text',
-                                              config.mask_dilation_offset, config.ocr.ignore_bubble, self.verbose,self.kernel_size)
+                                              config.mask_dilation_offset, config.ocr.ignore_bubble, self.verbose,self.kernel_size,
+                                              bubble_mode=config.render.overflow_strategy == 'bubble')
 
     async def _run_inpainting(self, config: Config, ctx: Context):
         current_time = time.time()
         self._model_usage_timestamps[("inpainting", config.inpainter.inpainter)] = current_time
         out = await dispatch_inpainting(config.inpainter.inpainter, ctx.img_rgb, ctx.mask, config.inpainter, config.inpainter.inpainting_size, self.device,
                                          self.verbose)
-        if config.inpainter.inpainter != Inpainter.none and out is not None:
+        # Comic flat-fill repair is opt-in: product gradients/textures retain the
+        # established inpainter path rather than being repainted with one colour.
+        if (config.render.overflow_strategy == 'bubble'
+                and config.inpainter.inpainter != Inpainter.none and out is not None):
             fixed = restore_flat_backgrounds(ctx.img_rgb, ctx.mask, out, ctx.text_regions,
                                              ctx.mask_raw)
             if fixed:

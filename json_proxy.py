@@ -111,8 +111,12 @@ async def translate_image(request: Request):
     # Verified on product images (testglass1): box_threshold=0.25 + unclip_ratio=3.5
     # captures small note lines AND avoids truncating long spec lines (e.g.
     # "适用场景：驾驶|出行|通勤" was being cut to "驾驶|出" with the old 2.5 ratio).
+    requested_engine = (rc.get("engine") or req.get("engine") or "").lower()
+    manga_requested = (requested_engine in ("manga", "vlm")
+                       or det_cfg.get("detector") == "ensemble"
+                       or (rc.get("ocr", {}) or {}).get("ocr") == "vlm")
     text_th = det_cfg.get("text_threshold")
-    if text_th and float(text_th) <= 0.3:
+    if not manga_requested and text_th and float(text_th) <= 0.3:
         if not det_cfg.get("box_threshold"):
             det_cfg["box_threshold"] = 0.25
         if not det_cfg.get("unclip_ratio"):
@@ -156,7 +160,11 @@ async def translate_image(request: Request):
         if "disable_font_border" not in _rc_render:
             _rc_render["disable_font_border"] = True
         if not _rc_render.get("overflow_strategy"):
-            _rc_render["overflow_strategy"] = "cascade"
+            # "bubble", not "cascade": a balloon has no free space around it, so
+            # the cascade rules (expand into the neighbour gap) let the text run
+            # out through the outline. "bubble" keeps it inside the footprint the
+            # original text occupied and shrinks to fit.
+            _rc_render["overflow_strategy"] = "bubble"
     elif engine == "paddle" or det_cfg.get("detector") == "paddle_ocr":
         det_cfg["detector"] = "paddle_ocr"
         rc.setdefault("ocr", {})["ocr"] = "paddle"
@@ -319,8 +327,8 @@ def _extract_regions_meta(result):
 
     for i, region in enumerate(regions):
         try:
-            texts = getattr(region, "texts", None)
-            lines = len(texts) if texts is not None else None
+            source_lines = getattr(region, "lines", None)
+            lines = len(source_lines) if source_lines is not None else None
             # Final rendered box (post expand/normalize/overlap-resolve) — the
             # box the translated text is actually warped into. This is the real
             # ground truth for overlap and displayed-size checks.
@@ -337,6 +345,10 @@ def _extract_regions_meta(result):
                 "render_lines": int(getattr(region, "_render_lines", 0) or 0) or None,
                 "box": _box(region),
                 "render_box": render_box,
+                "bubble_group": getattr(region, "_bubble_group", None),
+                "bubble_original_lines": getattr(region, "_bubble_original_lines", None),
+                "bubble_retained_lines": getattr(region, "_bubble_retained_lines", None),
+                "bubble_visible_ink_height": getattr(region, "_bubble_visible_ink_height", None),
             })
         except Exception as e:
             out.append({"id": i, "error": str(e)})
