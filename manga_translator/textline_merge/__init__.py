@@ -107,6 +107,22 @@ def split_text_region(
 #     box = np.array(box)
 #     return box
 
+def _style_heights(item):
+    """Explicit VLM glyph measurements only; detector box size is not style."""
+    values = getattr(item, 'ocr_style_heights', None)
+    if values is None:
+        values = [getattr(item, 'ocr_style_height', None)]
+    return [float(value) for value in values
+            if value is not None and np.isfinite(value) and value > 0]
+
+
+def _compatible_styles(items):
+    sizes = [size for item in items for size in _style_heights(item)]
+    # Deliberately independent of caller-supplied stacked slack: geometric
+    # uncertainty may be relaxed, but measured shouting/body styles may not.
+    return not sizes or max(sizes) <= min(sizes) * 1.3
+
+
 def merge_bboxes_text_region(bboxes: List[Quadrilateral], width, height,
                              font_size_ratio_tol: float = 1.3,
                              aspect_ratio_tol: float = 1.3,
@@ -134,14 +150,29 @@ def merge_bboxes_text_region(bboxes: List[Quadrilateral], width, height,
     for i, box in enumerate(bboxes):
         G.add_node(i, box=box)
 
+    components = nx.utils.UnionFind(range(len(bboxes)))
+    members = {i: [box] for i, box in enumerate(bboxes)}
     for ((u, ubox), (v, vbox)) in itertools.combinations(enumerate(bboxes), 2):
-        # if quadrilateral_can_merge_region_coarse(ubox, vbox):
+        ur, vr = components[u], components[v]
+        combined = members[ur] if ur == vr else members[ur] + members[vr]
+        # Check the entire proposed component, not just this edge. An uncertain
+        # intermediate line must not bridge a large and a small explicit style.
+        if not _compatible_styles(combined):
+            continue
+        # Compatible measured styles may still need the original geometric
+        # slack for ascenders/descenders. Conflicting styles were rejected
+        # above, so slack can never override their explicit boundary.
         if quadrilateral_can_merge_region(ubox, vbox, aspect_ratio_tol=aspect_ratio_tol,
                                           font_size_ratio_tol=font_size_ratio_tol,
                                           char_gap_tolerance=char_gap_tolerance,
                                           char_gap_tolerance2=char_gap_tolerance2,
                                           stacked_font_ratio_slack=stacked_font_ratio_slack):
             G.add_edge(u, v)
+            if ur != vr:
+                components.union(ur, vr)
+                members.pop(ur)
+                members.pop(vr)
+                members[components[u]] = combined
 
     # step 2: postprocess - further split each region
     region_indices: List[Set[int]] = []
@@ -206,6 +237,8 @@ def merge_closed_bubble_regions(regions, image):
             continue
         members.sort(key=lambda i: boxes[i][1])
         ordered = [regions[i] for i in members]
+        if not _compatible_styles(ordered):
+            continue
         sizes = [float(region.font_size) for region in ordered]
         if min(sizes) <= 0 or max(sizes) / min(sizes) > 1.15:
             continue
@@ -234,6 +267,9 @@ def merge_closed_bubble_regions(regions, image):
             fg_color=np.median([region.get_font_colors()[0] for region in ordered], axis=0),
             bg_color=np.median([region.get_font_colors()[1] for region in ordered], axis=0))
         merged.text_raw = merged.text
+        merged.ocr_style_heights = [size for region in ordered for size in _style_heights(region)]
+        merged.ocr_ink_heights = [size for region in ordered
+                                  for size in getattr(region, 'ocr_ink_heights', [])]
         first = min(members)
         replacements[first] = merged
         removed.update(i for i in members if i != first)
@@ -265,5 +301,10 @@ async def dispatch(textlines: List[Quadrilateral], width: int, height: int, verb
         texts = [txtln.text for txtln in txtlns]
         region = TextBlock(lines, texts, font_size=font_size, angle=angle, prob=np.exp(total_logprobs),
                            fg_color=fg_color, bg_color=bg_color)
+        # Carry source measurements through later bubble regrouping; these are
+        # pre-render evidence, not a claim about final displayed font size.
+        region.ocr_style_heights = [size for line in txtlns for size in _style_heights(line)]
+        region.ocr_ink_heights = [float(line.ocr_ink_height) for line in txtlns
+                                 if hasattr(line, 'ocr_ink_height')]
         text_regions.append(region)
     return text_regions

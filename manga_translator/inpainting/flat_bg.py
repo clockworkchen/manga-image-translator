@@ -34,6 +34,63 @@ def _line_boxes(region, w: int, h: int):
     return out
 
 
+def _restore_smooth_region(original, erased, output, boxes):
+    """Fit a locally verified colour plane; preserve gradients and glyph halos.
+
+    Only enclosed contrast components inside the padded line footprint are
+    erased. Edge-connected artwork/balloon outlines are never repainted.
+    Insufficient agreement with a smooth surface leaves the inpainter alone.
+    """
+    h, w = erased.shape
+    x1 = max(0, min(b[0] for b in boxes) - 6)
+    y1 = max(0, min(b[1] for b in boxes) - 6)
+    x2 = min(w, max(b[2] for b in boxes) + 6)
+    y2 = min(h, max(b[3] for b in boxes) + 6)
+    win = original[y1:y2, x1:x2]
+    if not win.size or not erased[y1:y2, x1:x2].any():
+        return False
+    yy, xx = np.indices(win.shape[:2], dtype=np.float32)
+    design = np.stack([np.ones_like(xx), xx / max(1, win.shape[1]),
+                       yy / max(1, win.shape[0])], axis=-1).reshape(-1, 3)
+    pixels = win.reshape(-1, 3).astype(np.float32)
+    median = np.median(pixels, axis=0)
+    keep = np.max(np.abs(pixels - median), axis=1) < 30
+    for _ in range(4):
+        if keep.sum() < 40 or keep.mean() < 0.60:
+            return False
+        coefficients = np.linalg.lstsq(design[keep], pixels[keep], rcond=None)[0]
+        plane = design @ coefficients
+        error = np.max(np.abs(pixels - plane), axis=1)
+        keep = error < 8
+    if keep.mean() < 0.65 or np.percentile(error[keep], 95) > 5:
+        return False
+    background = np.clip(plane, 0, 255).reshape(win.shape)
+    contrast = (error.reshape(win.shape[:2]) > 12).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(contrast, connectivity=8)
+    domain = np.zeros(win.shape[:2], np.uint8)
+    for lx1, ly1, lx2, ly2 in boxes:
+        cv2.rectangle(domain, (lx1-x1-2, ly1-y1-2), (lx2-x1+2, ly2-y1+2), 1, -1)
+    selected = np.zeros(num, bool)
+    for label in range(1, num):
+        x, y, bw, bh, area = stats[label]
+        component = labels == label
+        if x <= 0 or y <= 0 or x+bw >= win.shape[1] or y+bh >= win.shape[0]:
+            continue
+        if area and (domain[component] > 0).mean() >= 0.98:
+            selected[label] = True
+    glyphs = cv2.dilate(selected[labels].astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    if not glyphs.any():
+        return False
+    # Do not restore a missed component and thereby resurrect text.
+    if (contrast.astype(bool) & (domain > 0) & ~glyphs).sum() > 4:
+        return False
+    safe_restore = erased[y1:y2, x1:x2] & ~glyphs & (error.reshape(win.shape[:2]) < 8)
+    target = output[y1:y2, x1:x2]
+    target[safe_restore] = win[safe_restore]
+    target[glyphs] = np.rint(background[glyphs]).astype(output.dtype)
+    return True
+
+
 def restore_flat_backgrounds(img_rgb: np.ndarray, mask: np.ndarray,
                              inpainted: np.ndarray, text_regions: List = None,
                              mask_raw: np.ndarray = None, tol: int = 22,
@@ -107,6 +164,9 @@ def restore_flat_backgrounds(img_rgb: np.ndarray, mask: np.ndarray,
     for region in text_regions:
         boxes = _line_boxes(region, w, h)
         if not boxes:
+            continue
+        if _restore_smooth_region(img_rgb, erased, inpainted, boxes):
+            fixed += 1
             continue
         font = float(getattr(region, 'font_size', 0) or 0)
 

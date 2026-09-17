@@ -994,7 +994,7 @@ def _bubble_groups(original_img, boxes):
     """Conservative closed light/dark interiors, used ONLY for grouping.
 
     No dilation/closing that could bridge an outline. Components touching the
-    page edge or occupying >20% of it are rejected; uncertain blocks stay solo.
+    page edge or occupying >35% of it are rejected; uncertain blocks stay solo.
     This is not balloon polygon extraction, and NEVER enlarges a text footprint.
     """
     groups = list(range(len(boxes)))
@@ -1003,7 +1003,10 @@ def _bubble_groups(original_img, boxes):
     gray = original_img if original_img.ndim == 2 else cv2.cvtColor(original_img, cv2.COLOR_RGB2GRAY)
     height, width = gray.shape
     assigned = {}
-    for polarity, background in enumerate((gray >= 220, gray <= 35)):
+    # Include light pastel gradients and charcoal balloons, not just pure white
+    # or black. Outlines still separate components; page-edge/area checks below
+    # reject the exterior. No closing that could bridge a broken outline.
+    for polarity, background in enumerate((gray >= 180, gray <= 80)):
         _, labels, stats, _ = cv2.connectedComponentsWithStats(background.astype(np.uint8), connectivity=4)
         for i, (x1, y1, x2, y2) in enumerate(boxes):
             if i in assigned:
@@ -1019,7 +1022,7 @@ def _bubble_groups(original_img, boxes):
             count, label = max(candidates)
             x, y, w, h, area = stats[label]
             if (count < crop.size * 0.30 or x <= 0 or y <= 0 or
-                    x + w >= width or y + h >= height or area > width * height * 0.20):
+                    x + w >= width or y + h >= height or area > width * height * 0.35):
                 continue
             if x > x1 or y > y1 or x + w < x2 or y + h < y2:
                 continue

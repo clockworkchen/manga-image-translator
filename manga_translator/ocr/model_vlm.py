@@ -351,16 +351,23 @@ class ModelVlmOCR(CommonOCR):
         many lines the translation may occupy. Splitting here is what lets a
         three-line bubble stay three lines.
         """
-        bands = self._ink_bands(image, rect, len(lines))
+        style_heights = []
+        bands = self._ink_bands(image, rect, len(lines), style_heights=style_heights)
         out = []
-        for text, (bx1, by1, bx2, by2) in zip(lines, bands):
+        for i, (text, (bx1, by1, bx2, by2)) in enumerate(zip(lines, bands)):
             box = np.array([[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]],
                            dtype=np.float32)
-            out.append(Quadrilateral(box, text, 1.0))
+            line = Quadrilateral(box, text, 1.0)
+            # Equal-slice fallback has no measured style evidence. Do not label
+            # its guessed height as a real font boundary.
+            if style_heights:
+                line.ocr_ink_height = float(by2 - by1)
+                line.ocr_style_height = style_heights[i]
+            out.append(line)
         return out
 
     @staticmethod
-    def _ink_bands(image, rect, count, pad: int = 2):
+    def _ink_bands(image, rect, count, pad: int = 2, style_heights=None):
         """Locate the `count` lines of ink, as (x1, y1, x2, y2) each.
 
         Deliberately measured almost exactly inside `rect`. Padding this out to
@@ -405,22 +412,13 @@ class ModelVlmOCR(CommonOCR):
             runs = [r for r in runs if (r[1] - r[0]) >= max(3, tallest * 0.4)]
         if len(runs) != count:
             return equal
-        # Give every line in the block the SAME height, keeping its measured top.
-        #
-        # Box height is the font size downstream, and textline_merge refuses to
-        # merge two lines whose font sizes differ by more than ~1.3x. Measured
-        # ink height per line easily exceeds that without any font change: a line
-        # with no ascenders or descenders comes out short, while a line touching
-        # the balloon outline comes out tall. Both split one balloon into separate
-        # regions, which are then translated as disconnected fragments -
-        # "THAT / SKINSUIT" became "那个" + "人皮紧身衣" at 9px and 17px.
-        # These lines came back from a single crop the model read as one block,
-        # so they do share a font; asserting that here is more accurate than
-        # measuring each line separately, not less.
-        if len(runs) >= 2:
-            heights = sorted(b - a for a, b in runs)
-            med = heights[len(heights) // 2]
-            runs = [(a, a + med) for a, b in runs]
+        # A shared OCR crop does NOT imply a shared font. Keep the real run
+        # bounds, including the full width measured over the original height:
+        # median-height replacement erased shouting/body hierarchy and could
+        # also truncate the bottom (and hence width) of the larger lettering.
+        if style_heights is not None:
+            style_heights.extend(ModelVlmOCR._glyph_style_height(ink[a:b])
+                                 for a, b in runs)
         out = []
         for a, b in runs:
             cols = np.where(ink[a:b].sum(axis=0) > 0)[0]
@@ -430,3 +428,26 @@ class ModelVlmOCR(CommonOCR):
                 bx1, bx2 = x1, x2
             out.append((bx1, py1 + a, bx2, py1 + b))
         return out
+
+    @staticmethod
+    def _glyph_style_height(ink):
+        """Robust evidence of letter size, not the extrema of a whole ink run.
+
+        Punctuation, speckles and long balloon edges must not turn a normal
+        dialogue line into a large-font style. Require several similarly tall
+        glyph components; ambiguous/connected lettering stays unlabelled and
+        retains the existing geometry-based merge policy.
+        """
+        height = ink.shape[0]
+        _, _, stats, _ = cv2.connectedComponentsWithStats(
+            ink.astype(np.uint8), connectivity=8)
+        sizes = [int(h) for x, y, w, h, area in stats[1:]
+                 if max(3, height * 0.45) <= h
+                 and 2 <= w <= height * 2
+                 and area >= max(4, w * h * 0.08)]
+        if len(sizes) < 3:
+            return None
+        q25, q75 = np.percentile(sizes, [25, 75])
+        if q75 > q25 * 1.25:
+            return None
+        return float(np.median(sizes))
