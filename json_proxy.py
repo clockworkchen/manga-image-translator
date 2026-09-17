@@ -341,6 +341,7 @@ def _extract_regions_meta(result):
                 "orig_font_size": int(getattr(region, "_orig_font_size", 0) or 0),
                 "alignment": getattr(region, "alignment", None),
                 "horizontal": bool(getattr(region, "horizontal", False)),
+                "angle": float(getattr(region, "angle", 0) or 0),
                 "lines": lines,
                 "render_lines": int(getattr(region, "_render_lines", 0) or 0) or None,
                 "box": _box(region),

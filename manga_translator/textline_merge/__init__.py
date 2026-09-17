@@ -220,6 +220,27 @@ def merge_bboxes_text_region(bboxes: List[Quadrilateral], width, height,
         # yield overall bbox and sorted indices
         yield txtlns, (fg_r, fg_g, fg_b), (bg_r, bg_g, bg_b)
 
+def _merge_region_members(regions, members, boxes):
+    """Construct one region after the caller has proved ownership/style."""
+    members = sorted(members, key=lambda i: boxes[i][1])
+    ordered = [regions[i] for i in members]
+    entries = [(line, text) for region in ordered
+               for line, text in zip(region.lines, region.texts)]
+    entries.sort(key=lambda item: float(np.asarray(item[0])[:, 1].mean()))
+    sizes = [float(region.font_size) for region in ordered]
+    merged = TextBlock(
+        [item[0] for item in entries], [item[1] for item in entries],
+        font_size=float(np.median(sizes)), angle=0,
+        prob=min(region.prob for region in ordered),
+        fg_color=np.median([region.get_font_colors()[0] for region in ordered], axis=0),
+        bg_color=np.median([region.get_font_colors()[1] for region in ordered], axis=0))
+    merged.text_raw = merged.text
+    merged.ocr_style_heights = [size for region in ordered for size in _style_heights(region)]
+    merged.ocr_ink_heights = [size for region in ordered
+                              for size in getattr(region, 'ocr_ink_heights', [])]
+    return merged
+
+
 def merge_closed_bubble_regions(regions, image):
     """Join near-equal stacked text blocks only inside one closed comic balloon.
 
@@ -257,23 +278,61 @@ def merge_closed_bubble_regions(regions, image):
                 break
         if not connected:
             continue
-        entries = [(line, text) for region in ordered
-                   for line, text in zip(region.lines, region.texts)]
-        entries.sort(key=lambda item: float(np.asarray(item[0])[:, 1].mean()))
-        merged = TextBlock(
-            [item[0] for item in entries], [item[1] for item in entries],
-            font_size=float(np.median(sizes)), angle=0,
-            prob=min(region.prob for region in ordered),
-            fg_color=np.median([region.get_font_colors()[0] for region in ordered], axis=0),
-            bg_color=np.median([region.get_font_colors()[1] for region in ordered], axis=0))
-        merged.text_raw = merged.text
-        merged.ocr_style_heights = [size for region in ordered for size in _style_heights(region)]
-        merged.ocr_ink_heights = [size for region in ordered
-                                  for size in getattr(region, 'ocr_ink_heights', [])]
+        merged = _merge_region_members(regions, members, boxes)
         first = min(members)
         replacements[first] = merged
         removed.update(i for i in members if i != first)
     return [replacements.get(i, region) for i, region in enumerate(regions) if i not in removed]
+
+
+def merge_stacked_open_regions(regions):
+    """Conservative fallback for open/gradient balloons and mixed-script rows.
+
+    No background ownership is assumed. Merge only adjacent, centred, same-style
+    horizontal rows whose union cannot plausibly be two columns.
+    """
+    from ..rendering import _aabb_of
+    boxes = [_aabb_of(region.min_rect) for region in regions]
+    used, out = set(), []
+    order = sorted(range(len(regions)), key=lambda i: (boxes[i][1], boxes[i][0]))
+    for index in order:
+        if index in used:
+            continue
+        chain = [index]
+        while True:
+            current = chain[-1]
+            ax1, ay1, ax2, ay2 = boxes[current]
+            candidates = []
+            for other in order:
+                if other in used or other in chain or boxes[other][1] < ay2 - 1:
+                    continue
+                bx1, by1, bx2, by2 = boxes[other]
+                overlap = min(ax2, bx2) - max(ax1, bx1)
+                gap = by1 - ay2
+                center_delta = abs((ax1 + ax2) - (bx1 + bx2)) / 2
+                scale = max(regions[current].font_size, regions[other].font_size, 1)
+                same_colour = np.linalg.norm(
+                    np.asarray(regions[current].get_font_colors()[0], float)
+                    - np.asarray(regions[other].get_font_colors()[0], float)) <= 45
+                min_width = min(ax2-ax1, bx2-bx1)
+                # Mixed CJK/Latin rows can differ greatly in width while sharing
+                # the same centre. Require meaningful overlap, but allow 35% when
+                # centring is especially strong; cross-column rows still fail.
+                overlap_requirement = 0.35 if center_delta <= scale * 1.0 else 0.55
+                if (0 <= gap <= scale * 0.9
+                        and overlap >= overlap_requirement * min_width
+                        and center_delta <= scale * 2.5
+                        and abs(regions[current].angle) <= 3 and abs(regions[other].angle) <= 3
+                        and _compatible_styles([regions[current], regions[other]])
+                        and 0.84 <= regions[current].font_size / max(regions[other].font_size, 1) <= 1.18
+                        and same_colour):
+                    candidates.append((gap, center_delta, other))
+            if not candidates:
+                break
+            chain.append(min(candidates)[2])
+        used.update(chain)
+        out.append(_merge_region_members(regions, chain, boxes) if len(chain) > 1 else regions[index])
+    return out
 
 
 async def dispatch(textlines: List[Quadrilateral], width: int, height: int, verbose: bool = False,

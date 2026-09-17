@@ -2,6 +2,7 @@ import os
 import re
 import cv2
 import numpy as np
+from PIL import Image
 from typing import List
 from shapely import affinity
 from shapely.geometry import Polygon
@@ -1220,6 +1221,24 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
         region._render_lines = count
         region._bubble_retained_lines = count >= original_counts[i] if region.horizontal else None
         region._bubble_visible_ink_height = float(visible * scale)
+        angle = float(getattr(region, 'angle', 0) or 0)
+        if abs(angle) >= 3:
+            # Keep the source lettering angle. Expand the temporary canvas, but
+            # composite around the original footprint centre; do not clip corners.
+            rgba = Image.fromarray(raster, mode='RGBA').rotate(
+                angle, resample=Image.Resampling.BICUBIC, expand=True)
+            raster = np.asarray(rgba)
+            height, width = raster.shape[:2]
+            source_x1, source_y1, source_x2, source_y2 = map(float, region.xyxy)
+            contain = min((source_x2-source_x1) / max(width, 1),
+                          (source_y2-source_y1) / max(height, 1), 1.0)
+            if contain < 1:
+                width = max(1, int(np.floor(width * contain)))
+                height = max(1, int(np.floor(height * contain)))
+                raster = cv2.resize(raster, (width, height), interpolation=cv2.INTER_AREA)
+                region._bubble_visible_ink_height *= contain
+            cx, cy = (source_x1 + source_x2) / 2, (source_y1 + source_y2) / 2
+            x, y = int(round(cx - width / 2)), int(round(cy - height / 2))
         region._bubble_raster = (raster, x, y)
         points.append(np.array([[[x, y], [x + width, y], [x + width, y + height], [x, y + height]]], dtype=np.int64))
     return points
@@ -1288,9 +1307,16 @@ async def dispatch(
                 raster, x, y = prepared
                 h, w = raster.shape[:2]
                 alpha = raster[:, :, 3:4].astype(np.float32) / 255.0
-                crop = img[y:y+h, x:x+w]
-                crop[:] = np.clip(crop.astype(np.float32) * (1 - alpha) +
-                                  raster[:, :, :3].astype(np.float32) * alpha, 0, 255).astype(np.uint8)
+                ix1, iy1 = max(0, x), max(0, y)
+                ix2, iy2 = min(img.shape[1], x+w), min(img.shape[0], y+h)
+                if ix2 > ix1 and iy2 > iy1:
+                    rx1, ry1 = ix1-x, iy1-y
+                    rx2, ry2 = rx1+(ix2-ix1), ry1+(iy2-iy1)
+                    crop = img[iy1:iy2, ix1:ix2]
+                    local_alpha = alpha[ry1:ry2, rx1:rx2]
+                    local_rgb = raster[ry1:ry2, rx1:rx2, :3]
+                    crop[:] = np.clip(crop.astype(np.float32) * (1 - local_alpha) +
+                                      local_rgb.astype(np.float32) * local_alpha, 0, 255).astype(np.uint8)
             # Raster has already been fitted using visible ink. No second wrap
             # or homography stretch back to a nominal n-line detection box.
             region._bubble_raster = None

@@ -165,7 +165,8 @@ class ModelVlmOCR(CommonOCR):
                 continue
             if self._is_chrome(image, rect, lines):
                 continue
-            out.extend(self._split_into_lines(image, rect, lines))
+            out.extend(self._split_into_lines(image, rect, lines,
+                                              self._block_rotation(textlines, rect)))
         self.logger.info(f"vlm ocr: {len(textlines)} boxes -> {len(blocks)} blocks "
                          f"-> {len(out)} lines")
         return out
@@ -342,8 +343,28 @@ class ModelVlmOCR(CommonOCR):
         return text if isinstance(text, str) else None
 
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _block_rotation(textlines, rect):
+        """Robust signed detector rotation in degrees for one OCR crop."""
+        x1, y1, x2, y2 = rect
+        values = []
+        for detected in textlines:
+            pts = np.asarray(detected.pts).reshape(-1, 2).astype(float)
+            cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+            if not (x1 <= cx <= x2 and y1 <= cy <= y2):
+                continue
+            # Choose the longer adjacent edge as the text baseline, then normalize
+            # to [-90, 90). Point order can reverse, so 180 degrees is equivalent.
+            edges = [(pts[(i+1) % 4] - pts[i]) for i in range(4)]
+            vector = max(edges, key=lambda edge: np.linalg.norm(edge))
+            angle = np.degrees(np.arctan2(vector[1], vector[0]))
+            angle = (angle + 90) % 180 - 90
+            if abs(angle) <= 45:
+                values.append(angle)
+        return float(np.median(values)) if values else 0.0
+
     def _split_into_lines(self, image: np.ndarray, rect: List[float],
-                          lines: List[str]) -> List[Quadrilateral]:
+                          lines: List[str], rotation: float = 0.0) -> List[Quadrilateral]:
         """Turn one block holding `len(lines)` printed lines into one quad per line.
 
         Downstream everything assumes a Quadrilateral is a single line: the merge
@@ -357,6 +378,12 @@ class ModelVlmOCR(CommonOCR):
         for i, (text, (bx1, by1, bx2, by2)) in enumerate(zip(lines, bands)):
             box = np.array([[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]],
                            dtype=np.float32)
+            if abs(rotation) >= 3:
+                center = np.array([(bx1 + bx2) / 2, (by1 + by2) / 2])
+                radians = np.radians(rotation)
+                matrix = np.array([[np.cos(radians), -np.sin(radians)],
+                                   [np.sin(radians), np.cos(radians)]])
+                box = (box - center) @ matrix.T + center
             line = Quadrilateral(box, text, 1.0)
             # Equal-slice fallback has no measured style evidence. Do not label
             # its guessed height as a real font boundary.
