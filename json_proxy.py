@@ -192,6 +192,17 @@ async def translate_image(request: Request):
     _set(config.ocr, "ocr", ocr_cfg.get("ocr"))
     if ocr_cfg.get("prob") is not None:
         _set(config.ocr, "prob", ocr_cfg.get("prob"))
+    for attr, key in (
+        ("vlm_api_base", "vlm_api_base"), ("vlm_api_key", "vlm_api_key"),
+        ("vlm_model", "vlm_model"), ("vlm_concurrency", "vlm_concurrency"),
+        ("vlm_timeout", "vlm_timeout"),
+    ):
+        value = ocr_cfg.get(key)
+        if value is not None and value != "":
+            try:
+                setattr(config.ocr, attr, value)
+            except Exception:
+                pass
 
     # ── Render overrides ──────────────────────────────────────────
     if rc.get("inpainter", {}).get("inpainter"):

@@ -329,6 +329,16 @@ class OcrConfig(BaseModel):
     """The threshold for ignoring text in non bubble areas, with valid values ranging from 1 to 50, does not ignore others. Recommendation 5 to 10. If it is too low, normal bubble areas may be ignored, and if it is too large, non bubble areas may be considered normal bubbles"""
     prob: float | None = None
     """Minimum probability of a text region to be considered valid. If None, uses the model default."""
+    vlm_api_base: str | None = None
+    """Per-request OpenAI-compatible endpoint for VLM OCR; env vars remain fallback."""
+    vlm_api_key: str | None = None
+    """Per-request credential for VLM OCR. Never include this in debug metadata/logs."""
+    vlm_model: str | None = None
+    """Per-request vision-capable chat model used only for OCR."""
+    vlm_concurrency: int | None = None
+    """Maximum concurrent VLM OCR crops for this request."""
+    vlm_timeout: float | None = None
+    """Per-crop VLM OCR request timeout in seconds."""
 
 class Config(BaseModel):
     # General

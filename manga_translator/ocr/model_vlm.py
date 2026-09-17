@@ -88,9 +88,15 @@ class ModelVlmOCR(CommonOCR):
         if not textlines:
             return []
 
-        base = os.environ.get("VLM_OCR_API_BASE") or os.environ.get("CUSTOM_OPENAI_API_BASE")
-        key = os.environ.get("VLM_OCR_API_KEY") or os.environ.get("CUSTOM_OPENAI_API_KEY")
-        model = os.environ.get("VLM_OCR_MODEL") or os.environ.get("CUSTOM_OPENAI_MODEL")
+        # Request-level Panel selection wins, so changing the OCR model/channel
+        # applies to the next task without recreating the MT container. Dedicated
+        # env vars and legacy CUSTOM_OPENAI_* remain compatibility fallbacks.
+        base = (config.vlm_api_base or os.environ.get("VLM_OCR_API_BASE")
+                or os.environ.get("CUSTOM_OPENAI_API_BASE"))
+        key = (config.vlm_api_key or os.environ.get("VLM_OCR_API_KEY")
+               or os.environ.get("CUSTOM_OPENAI_API_KEY"))
+        model = (config.vlm_model or os.environ.get("VLM_OCR_MODEL")
+                 or os.environ.get("CUSTOM_OPENAI_MODEL"))
         if not base or not model:
             self.logger.warning("vlm ocr: no API base/model configured, using 48px_ctc")
             return await self._run_fallback(image, textlines, config, verbose)
@@ -108,7 +114,8 @@ class ModelVlmOCR(CommonOCR):
         # the reference page one crop held more text than the model expected, it
         # answered under the next index, and every block after it received its
         # neighbour's dialogue. A crop per request has nothing to misalign.
-        sem = asyncio.Semaphore(max(1, int(os.environ.get("VLM_OCR_CONCURRENCY", "6"))))
+        concurrency = config.vlm_concurrency or int(os.environ.get("VLM_OCR_CONCURRENCY", "6"))
+        sem = asyncio.Semaphore(max(1, min(int(concurrency), 32)))
         failures = 0
         blocked = asyncio.Event()
 
@@ -120,7 +127,8 @@ class ModelVlmOCR(CommonOCR):
                 try:
                     return await self._ask(base, key, model,
                                            self._crop(image, rect),
-                                           self._where(image, rect))
+                                           self._where(image, rect),
+                                           config.vlm_timeout)
                 except VlmRequestBlocked:
                     blocked.set()
                     raise
@@ -292,7 +300,8 @@ class ModelVlmOCR(CommonOCR):
         return crop
 
     async def _ask(self, base: str, key: Optional[str], model: str,
-                   crop: np.ndarray, hint: str) -> Optional[str]:
+                   crop: np.ndarray, hint: str,
+                   configured_timeout: Optional[float] = None) -> Optional[str]:
         import httpx
 
         ok, buf = cv2.imencode(".png", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
@@ -308,7 +317,7 @@ class ModelVlmOCR(CommonOCR):
         headers = {"Content-Type": "application/json"}
         if key:
             headers["Authorization"] = f"Bearer {key}"
-        timeout = float(os.environ.get("VLM_OCR_TIMEOUT", "120"))
+        timeout = float(configured_timeout or os.environ.get("VLM_OCR_TIMEOUT", "120"))
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 base.rstrip("/") + "/chat/completions",
