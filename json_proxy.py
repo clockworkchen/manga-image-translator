@@ -10,7 +10,7 @@ Exposes:  GET  /health        → {"ok": true}
 Internal manga-translator shared API runs on port 5005.
 This proxy listens on port 5003 (configurable via MT_PROXY_PORT env var).
 """
-import base64, io, os, pickle, time
+import asyncio, base64, io, os, pickle, time
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
@@ -29,6 +29,8 @@ PROXY_PORT = int(os.environ.get("MT_PROXY_PORT", "5003"))
 # Disable the internal read timeout by default: the public API is asynchronous and
 # callers poll the task record, while the shared worker already serializes work.
 SHARED_READ_TIMEOUT_SEC = float(os.environ.get("MT_SHARED_READ_TIMEOUT_SEC", "0"))
+SHARED_BUSY_WAIT_SEC = float(os.environ.get("MT_SHARED_BUSY_WAIT_SEC", "180"))
+SHARED_BUSY_POLL_SEC = max(0.2, float(os.environ.get("MT_SHARED_BUSY_POLL_SEC", "1")))
 
 
 def _shared_timeout():
@@ -232,17 +234,25 @@ async def translate_image(request: Request):
     started_at = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=_shared_timeout()) as c:
-            r = await c.post(
-                f"{SHARED}/simple_execute/translate",
-                content=payload,
-                headers={"Content-Type": "application/octet-stream"},
-            )
+            deadline = time.monotonic() + SHARED_BUSY_WAIT_SEC
+            while True:
+                r = await c.post(
+                    f"{SHARED}/simple_execute/translate",
+                    content=payload,
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+                if r.status_code != 429 or time.monotonic() >= deadline:
+                    break
+                # Shared rejects before consuming the pickle payload while locked,
+                # so resubmitting the same bytes is safe. Never retry any other
+                # status (especially safety, auth, quota or translation errors).
+                await asyncio.sleep(SHARED_BUSY_POLL_SEC)
     except Exception as e:
         detail = _connection_error_detail(e, time.monotonic() - started_at)
         raise HTTPException(503, detail=detail) from e
 
     if r.status_code == 429:
-        raise HTTPException(429, detail="Translator is busy, please retry")
+        raise HTTPException(429, detail=f"Translator remained busy for {SHARED_BUSY_WAIT_SEC:.0f}s")
     if r.status_code != 200:
         raise HTTPException(r.status_code, detail=r.text[:2000])
 
