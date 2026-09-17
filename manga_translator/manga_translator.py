@@ -1059,6 +1059,27 @@ class MangaTranslator:
             'cpu' if self._gpu_limited_memory else self.device
         )
 
+    @staticmethod
+    def _preserve_leading_bracket_group(source: str, translation: str) -> str:
+        """Keep a source-leading 【…】 label before translated trailing grammar.
+
+        Japanese ``【action】をさせる`` is naturally translated as ``让【action】``;
+        that is linguistically valid, but reverses the image's visual label/suffix
+        order. For localization layout the bracketed label is structural, so move
+        a single translated leading ``让/使/令 + 【…】`` back to ``【…】 + 让/使/令``.
+        The rule is deliberately narrow and only applies when the source itself
+        starts with a complete lenticular-bracket group.
+        """
+        source = str(source or '').strip()
+        translation = str(translation or '').strip()
+        if not re.match(r'^【[^】]+】', source):
+            return translation
+        match = re.match(r'^\s*([让使令])\s*(【[^】]+】)(.*)$', translation)
+        if not match:
+            return translation
+        verb, label, tail = match.groups()
+        return f'{label}{verb}{tail}'.strip()
+
     async def _run_text_translation(self, config: Config, ctx: Context):
         # 检查text_regions是否为None或空
         if not ctx.text_regions:
@@ -1120,6 +1141,7 @@ class MangaTranslator:
                     translation = translation.upper()  
                 elif config.render.lowercase:  
                     translation = translation.lower()  # 修正：应该是lower而不是upper  
+                translation = self._preserve_leading_bracket_group(region.text, translation)
                 region.translation = translation  
                 region.target_lang = config.translator.target_lang  
                 region._alignment = config.render.alignment  

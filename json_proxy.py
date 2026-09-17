@@ -221,6 +221,8 @@ async def translate_image(request: Request):
             "You are a professional translation engine. "
             "Translate the following text into {to_lang}. "
             "Output ONLY the translated lines with the exact same <|N|> prefix numbers. "
+            "Preserve the visual order of bracketed labels: if a source line starts with "
+            "【...】, the translation must also start with its translated 【...】 group. "
             "Do NOT output the original. Do NOT explain. Just translate.\n"
             "Translate to {to_lang}:\n"
         )
@@ -361,6 +363,8 @@ def _extract_regions_meta(result):
                 "font_size": int(getattr(region, "font_size", 0) or 0),
                 "orig_font_size": int(getattr(region, "_orig_font_size", 0) or 0),
                 "alignment": getattr(region, "alignment", None),
+                "fg_color": [int(v) for v in region.get_font_colors()[0]],
+                "bg_color": [int(v) for v in region.get_font_colors()[1]],
                 "horizontal": bool(getattr(region, "horizontal", False)),
                 "angle": float(getattr(region, "angle", 0) or 0),
                 "lines": lines,

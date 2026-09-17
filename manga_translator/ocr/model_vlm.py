@@ -397,6 +397,9 @@ class ModelVlmOCR(CommonOCR):
                                    [np.sin(radians), np.cos(radians)]])
                 box = (box - center) @ matrix.T + center
             line = Quadrilateral(box, text, 1.0)
+            fg, bg = self._extract_line_colors(image, box)
+            line.fg_r, line.fg_g, line.fg_b = (int(value) for value in fg)
+            line.bg_r, line.bg_g, line.bg_b = (int(value) for value in bg)
             # Equal-slice fallback has no measured style evidence. Do not label
             # its guessed height as a real font boundary.
             if style_heights:
@@ -404,6 +407,32 @@ class ModelVlmOCR(CommonOCR):
                 line.ocr_style_height = style_heights[i]
             out.append(line)
         return out
+
+    @staticmethod
+    def _extract_line_colors(image: np.ndarray, box: np.ndarray):
+        """Estimate glyph/background RGB for VLM OCR lines.
+
+        VLM only returns text, so the old path left every line at Quadrilateral's
+        black-on-black defaults. Rendering then changed coloured lettering to
+        black. Use Otsu solely for polarity separation and robust medians for the
+        colours; the tight line box makes the minority cluster the glyph ink.
+        """
+        h, w = image.shape[:2]
+        pts = np.asarray(box).reshape(-1, 2).astype(np.int32)
+        x1, y1 = max(0, int(pts[:, 0].min())), max(0, int(pts[:, 1].min()))
+        x2, y2 = min(w, int(pts[:, 0].max())), min(h, int(pts[:, 1].max()))
+        if x2 <= x1 or y2 <= y1:
+            return np.array([0, 0, 0]), np.array([255, 255, 255])
+        crop = image[y1:y2, x1:x2]
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        _, threshold = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        dark, light = threshold == 0, threshold == 255
+        text_mask, bg_mask = (dark, light) if dark.sum() <= light.sum() else (light, dark)
+        if text_mask.sum() < 4 or bg_mask.sum() < 4:
+            return np.array([0, 0, 0]), np.array([255, 255, 255])
+        fg = np.rint(np.median(crop[text_mask], axis=0)).astype(np.int32)
+        bg = np.rint(np.median(crop[bg_mask], axis=0)).astype(np.int32)
+        return fg, bg
 
     @staticmethod
     def _ink_bands(image, rect, count, pad: int = 2, style_heights=None):

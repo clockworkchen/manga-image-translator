@@ -53,6 +53,37 @@ def seed_unmasked_lines(raw_mask: np.ndarray, raw_image: np.ndarray,
             seeded += 1
     return seeded
 
+def ensure_line_ink_coverage(final_mask: np.ndarray, raw_image: np.ndarray,
+                              text_regions: List[TextBlock]) -> np.ndarray:
+    """Union a conservative Otsu glyph mask for every recognized line.
+
+    Detector masks can cover only the dark core while leaving coloured/antialiased
+    edges behind. The previous seeding skipped any line with just 2% coverage, so
+    a partial mask prevented the fallback entirely. Always derive the tight-box
+    minority-polarity ink, lightly dilate it, and union it with refinement.
+    """
+    h, w = final_mask.shape[:2]
+    extra = np.zeros_like(final_mask)
+    for region in text_regions:
+        for line in getattr(region, 'lines', []) or []:
+            pts = np.asarray(line).reshape(-1, 2).astype(np.int32)
+            x1, y1 = max(0, int(pts[:, 0].min())), max(0, int(pts[:, 1].min()))
+            x2, y2 = min(w, int(pts[:, 0].max())), min(h, int(pts[:, 1].max()))
+            if x2 - x1 < 4 or y2 - y1 < 4:
+                continue
+            crop = raw_image[y1:y2, x1:x2]
+            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.ndim == 3 else crop
+            _, threshold = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            dark, light = threshold == 0, threshold == 255
+            ink = dark if dark.sum() <= light.sum() else light
+            ratio = float(ink.mean())
+            if ratio < 0.01 or ratio > 0.45:
+                continue
+            ink = cv2.dilate(ink.astype(np.uint8) * 255, np.ones((3, 3), np.uint8))
+            extra[y1:y2, x1:x2] = np.maximum(extra[y1:y2, x1:x2], ink)
+    return cv2.bitwise_or(final_mask, extra)
+
+
 def clip_mask_to_lines(final_mask: np.ndarray, text_regions: List[TextBlock]) -> np.ndarray:
     """Drop mask that lies outside the recognized text lines.
 
@@ -123,6 +154,7 @@ async def dispatch(text_regions: List[TextBlock], raw_image: np.ndarray, raw_mas
         final_mask = cv2.resize(final_mask, (raw_image.shape[1], raw_image.shape[0]), interpolation = cv2.INTER_LINEAR)
         final_mask[final_mask > 0] = 255
         if bubble_mode:
+            final_mask = ensure_line_ink_coverage(final_mask, raw_image, text_regions)
             final_mask = clip_mask_to_lines(final_mask, text_regions)
 
     if ignore_bubble < 1 or ignore_bubble > 50:
