@@ -65,7 +65,10 @@ def ensure_line_ink_coverage(final_mask: np.ndarray, raw_image: np.ndarray,
     h, w = final_mask.shape[:2]
     extra = np.zeros_like(final_mask)
     for region in text_regions:
-        for line in getattr(region, 'lines', []) or []:
+        lines = getattr(region, 'lines', None)
+        if lines is None:
+            continue
+        for line in lines:
             pts = np.asarray(line).reshape(-1, 2).astype(np.int32)
             x1, y1 = max(0, int(pts[:, 0].min())), max(0, int(pts[:, 1].min()))
             x2, y2 = min(w, int(pts[:, 0].max())), min(h, int(pts[:, 1].max()))
