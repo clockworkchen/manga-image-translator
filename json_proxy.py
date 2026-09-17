@@ -293,9 +293,24 @@ async def translate_image(request: Request):
             "region_count": len(regions_meta),
             "raw_detections": raw_dets,
             "raw_detection_count": len(raw_dets),
+            "mask": _encode_debug_image(getattr(result, "mask", None), mode="L"),
+            "inpainted": _encode_debug_image(getattr(result, "img_inpainted", None)),
         }
 
     return Response(content=buf.getvalue(), media_type="image/png")
+
+
+def _encode_debug_image(value, mode="RGB"):
+    if value is None:
+        return None
+    try:
+        import numpy as _np
+        image = Image.fromarray(_np.asarray(value).astype(_np.uint8), mode=mode)
+        stream = io.BytesIO()
+        image.save(stream, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(stream.getvalue()).decode()
+    except Exception:
+        return None
 
 
 def _extract_raw_detections(result):
