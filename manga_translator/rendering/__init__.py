@@ -991,47 +991,116 @@ def _bubble_ink_runs(mask):
     return (np.flatnonzero(edges == -1) - np.flatnonzero(edges == 1)).tolist()
 
 
-def _bubble_groups(original_img, boxes):
-    """Conservative closed light/dark interiors, used ONLY for grouping.
+def _bubble_components(original_img, boxes):
+    """Find conservative closed balloon interiors and their true pixel masks.
 
-    No dilation/closing that could bridge an outline. Components touching the
-    page edge or occupying >35% of it are rejected; uncertain blocks stay solo.
-    This is not balloon polygon extraction, and NEVER enlarges a text footprint.
+    The light/dark fill itself is the component. We deliberately do not dilate or
+    close it: either operation can jump a thin balloon outline, a panel border or
+    a character edge. A component is accepted only when its fill owns a material
+    part of the source-text box, encloses the box centre, stays away from the page
+    edge, and is small enough to be one balloon rather than a panel/background.
     """
-    groups = list(range(len(boxes)))
+    found = {}
     if original_img is None:
-        return groups
+        return found
     gray = original_img if original_img.ndim == 2 else cv2.cvtColor(original_img, cv2.COLOR_RGB2GRAY)
     height, width = gray.shape
-    assigned = {}
-    # Include light pastel gradients and charcoal balloons, not just pure white
-    # or black. Outlines still separate components; page-edge/area checks below
-    # reject the exterior. No closing that could bridge a broken outline.
+    image_area = width * height
     for polarity, background in enumerate((gray >= 180, gray <= 80)):
-        _, labels, stats, _ = cv2.connectedComponentsWithStats(background.astype(np.uint8), connectivity=4)
+        _, labels, stats, _ = cv2.connectedComponentsWithStats(
+            background.astype(np.uint8), connectivity=4)
         for i, (x1, y1, x2, y2) in enumerate(boxes):
-            if i in assigned:
+            if i in found:
                 continue
-            crop = labels[max(0, int(y1)):min(height, int(np.ceil(y2))),
-                          max(0, int(x1)):min(width, int(np.ceil(x2)))]
+            ix1, iy1 = max(0, int(np.floor(x1))), max(0, int(np.floor(y1)))
+            ix2, iy2 = min(width, int(np.ceil(x2))), min(height, int(np.ceil(y2)))
+            crop = labels[iy1:iy2, ix1:ix2]
             if not crop.size:
                 continue
             ids, counts = np.unique(crop, return_counts=True)
-            candidates = [(int(count), int(label)) for label, count in zip(ids, counts) if label]
+            candidates = sorted(((int(count), int(label)) for label, count in zip(ids, counts)
+                                 if label), reverse=True)
             if not candidates:
                 continue
-            count, label = max(candidates)
-            x, y, w, h, area = stats[label]
-            if (count < crop.size * 0.30 or x <= 0 or y <= 0 or
-                    x + w >= width or y + h >= height or area > width * height * 0.35):
+            count, label = candidates[0]
+            x, y, w, h, area = (int(v) for v in stats[label])
+            cx, cy = int(round((x1 + x2) / 2)), int(round((y1 + y2) / 2))
+            owns_centre = x <= cx < x + w and y <= cy < y + h
+            # The whole source AABB need not be fill: glyphs and outline pixels
+            # are holes. Requiring its centre inside the component envelope plus
+            # 30% fill is robust to a centre pixel landing on a glyph.
+            if (count < crop.size * 0.30 or not owns_centre or
+                    x <= 0 or y <= 0 or x + w >= width or y + h >= height or
+                    area > image_area * 0.08 or w > width * 0.55 or h > height * 0.35):
                 continue
-            if x > x1 or y > y1 or x + w < x2 or y + h < y2:
+            if w < (x2 - x1) * 0.65 or h < (y2 - y1) * 0.65:
                 continue
-            assigned[i] = (polarity, label)
+            mask = (labels[y:y + h, x:x + w] == label).astype(np.uint8) * 255
+            # Text is a set of holes in the balloon fill. Fill only enclosed
+            # holes; unlike morphological closing this cannot cross the outline.
+            padded = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+            exterior = padded.copy()
+            flood_mask = np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), np.uint8)
+            cv2.floodFill(exterior, flood_mask, (0, 0), 255)
+            holes = cv2.bitwise_not(exterior)[1:-1, 1:-1]
+            mask = cv2.bitwise_or(mask, holes)
+            found[i] = {
+                'key': (polarity, label), 'bounds': (x, y, x + w, y + h),
+                'mask': mask, 'area': area,
+            }
+    return found
+
+
+def _bubble_groups(original_img, boxes):
+    """Return stable group ids for text blocks sharing one closed balloon."""
+    groups = list(range(len(boxes)))
+    components = _bubble_components(original_img, boxes)
     first = {}
-    for i, key in assigned.items():
-        groups[i] = first.setdefault(key, i)
+    for i, component in components.items():
+        groups[i] = first.setdefault(component['key'], i)
     return groups
+
+
+def _bubble_safe_rect(component, source_box, ink_height):
+    """Conservative layout bounds from one closed balloon component.
+
+    The component is eroded by a glyph-dependent safety margin. Its resulting
+    envelope may include rounded corners outside the fill, so placement also keeps
+    a generous outline inset; unlike source AABB fitting this still recovers the
+    balloon's real central width and height without crossing panels or neighbours.
+    """
+    if not component:
+        return None
+    bx1, by1, bx2, by2 = component['bounds']
+    mask = component['mask']
+    pad = max(2, int(round(max(ink_height, 6.0) * 0.18)))
+    safe = cv2.erode(mask, np.ones((pad * 2 + 1, pad * 2 + 1), np.uint8))
+    if not np.any(safe):
+        return None
+    x1, y1, x2, y2 = source_box
+    cx = int(round((x1 + x2) / 2)) - bx1
+    cy = int(round((y1 + y2) / 2)) - by1
+    if not (0 <= cx < safe.shape[1] and 0 <= cy < safe.shape[0]):
+        return None
+
+    if safe[cy, cx] == 0:
+        # The exact centre can still coincide with residual antialiasing. Use the
+        # nearest safe pixel inside one source-line radius, never another lobe.
+        ys, xs = np.where(safe > 0)
+        near = np.argmin((xs - cx) ** 2 + (ys - cy) ** 2)
+        if (xs[near] - cx) ** 2 + (ys[near] - cy) ** 2 > max(ink_height, 6.0) ** 2:
+            return None
+    sx, sy, sw, sh = cv2.boundingRect(safe)
+    result = (float(bx1 + sx), float(by1 + sy),
+              float(bx1 + sx + sw), float(by1 + sy + sh))
+    # Accept a rectangle when it materially improves either line width or total
+    # area. Rounded balloons can trade unused source-box height for the wider
+    # centre band that a short translation actually needs.
+    result_w, result_h = result[2] - result[0], result[3] - result[1]
+    source_w, source_h = x2 - x1, y2 - y1
+    if result_w < source_w * 1.05 and result_w * result_h < source_w * source_h * 1.10:
+        return None
+    return result
 
 
 def _bubble_balanced_lines(text, requested, font):
@@ -1082,7 +1151,12 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
     source-line estimate limit it; never insert blank lines to meet a quota.
     """
     boxes = [_aabb_of(r.min_rect) for r in text_regions]
-    groups = _bubble_groups(original_img, boxes)
+    components = _bubble_components(original_img, boxes)
+    groups = list(range(len(boxes)))
+    first = {}
+    for i, component in components.items():
+        groups[i] = first.setdefault(component['key'], i)
+    physical_groups = groups.copy()
     heights, original_counts = {}, {}
     for i, region in enumerate(text_regions):
         box = boxes[i]
@@ -1143,15 +1217,36 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
     plans = {}
     for i, region in enumerate(text_regions):
         x1, y1, x2, y2 = boxes[i]
-        inset = max(1.0, heights[i] * 0.12)
-        if x2 - x1 <= inset * 2 + 2:
-            inset = 0
-        left, top = max(0, int(np.ceil(x1 + inset))), max(0, int(np.ceil(y1)))
-        right, bottom = min(img.shape[1], int(np.floor(x2 - inset))), min(img.shape[0], int(np.floor(y2)))
+        safe_rect = _bubble_safe_rect(components.get(i), boxes[i], heights[i])
+        # A shared component may cover multiple separately styled blocks. Keep
+        # each block in its own source band; widening is safe, but moving both to
+        # the component centre would overlap them (page1 title/body regression).
+        shared_component = any(j != i and physical_groups[j] == physical_groups[i]
+                               for j in range(len(physical_groups)))
+        boundary_kind = 'closed_component' if safe_rect is not None else 'source_footprint'
+        if safe_rect is not None:
+            left, top, right, bottom = safe_rect
+            if shared_component:
+                top, bottom = max(top, y1), min(bottom, y2)
+                if bottom - top < max(heights[i], 6.0):
+                    top, bottom = y1, y2
+        else:
+            inset = max(1.0, heights[i] * 0.12)
+            if x2 - x1 <= inset * 2 + 2:
+                inset = 0
+            left, top, right, bottom = x1 + inset, y1, x2 - inset, y2
+        left, top = max(0, int(np.ceil(left))), max(0, int(np.ceil(top)))
+        right, bottom = min(img.shape[1], int(np.floor(right))), min(img.shape[0], int(np.floor(bottom)))
         avail_w, avail_h = right - left, bottom - top
-        region._orig_font_size = int(region.font_size)
+        # Diagnostics and ratio floors must use measured source ink, not the
+        # detector's padded box-height font estimate (observed false 58/65px).
+        region._orig_font_size = int(round(max(heights[i], 1.0)))
+        region._bubble_source_ink_height = float(max(heights[i], 1.0))
         region._bubble_group = groups[i] if isinstance(groups[i], int) else str(groups[i][1])
         region._bubble_original_lines = int(original_counts[i])
+        region._bubble_boundary_kind = boundary_kind
+        region._bubble_bounds = [left, top, right, bottom]
+        region._bubble_layout_failed = None
         if avail_w < 1 or avail_h < 1:
             continue
         fg, bg = fg_bg_compare(*region.get_font_colors())
@@ -1160,7 +1255,16 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
         text = text_render.compact_special_symbols(region.get_translation_for_rendering())
         if not text.strip():
             continue
-        font = max(6, int(round(targets[i])))
+        # 12px is the absolute floor at 1080px page width. Preserve at least
+        # 55% of source size when the balloon permits it, but do not reject a
+        # geometrically unavoidable 12px rendering merely because the source was
+        # decorative 26px lettering in a 44px-wide bubble.
+        ratio_floor = min(18.0, max(heights[i], 1.0) * 0.60)
+        # Tiny/narrow balloons physically cannot preserve the ratio floor. In
+        # that case 12px remains the non-negotiable production minimum; the fit
+        # still fails closed if even 12px cannot be contained.
+        readable_floor = max(12.0, min(ratio_floor, avail_h * 0.48, avail_w * 0.32))
+        font = max(6, int(np.ceil(max(targets[i], readable_floor))))
         best = None
         if region.horizontal:
             # Include narrow widths so SHORT translations can retain multiple
@@ -1168,7 +1272,11 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
             # than source rows must fall back to fewer nonempty lines.
             upper = max(2 * font, avail_w)
             widths = sorted(set(int(round(w)) for w in np.linspace(2 * font, upper, 33)), reverse=True)
-            candidates = []
+            # Always probe the compact one-line form. Wrapping is calculated at
+            # the unscaled source font, but a short CJK translation can often fit
+            # one readable line after a modest uniform scale (the old path never
+            # discovered that candidate and instead forced two 9px rows).
+            candidates = [(text.strip(),)]
             for width in widths:
                 lines, _ = text_render.calc_horizontal(font, text, width, avail_h,
                                                        region.target_lang, hyphenate)
@@ -1176,11 +1284,10 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
             balanced = _bubble_balanced_lines(text, original_counts[i], font)
             if balanced:
                 candidates.append(balanced)
-            # Detector rows are a geometric hint, not a quota. A Chinese target
-            # often needs fewer rows than the English source; forcing all source
-            # rows made each glyph tiny. Prefer the fewest rows that still keeps
-            # at least 75% of the measured source ink height, then choose the
-            # closest source-row count only as a tie-breaker.
+        # Detector rows are a geometric hint, not a quota. If OCR metadata says
+        # more rows than the source region's own geometry, a compact translation
+        # must be allowed to collapse those surplus rows instead of becoming
+        # microtext (e.g. one real line incorrectly hinted as two detector rows).
             seen = set()
             for lines in candidates:
                 if not lines or lines in seen:
@@ -1191,25 +1298,27 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                     fg, bg, region.target_lang, hyphenate, line_spacing, prewrapped_lines=lines)
                 if raster is None or not raster.size:
                     continue
-                runs = _bubble_ink_runs(raster[:, :, 3])
-                visible = max(runs, default=raster.shape[0])
-                cap = min(targets[i], heights[i] * 1.10)
+                # Per-line visible height must come from the complete tight
+                # raster divided by the known line count. Adjacent CJK rows often
+                # touch, so alpha row-runs merge and `max(runs)` incorrectly sees
+                # two 13px rows as one 26px glyph, halving the final text.
+                visible = raster.shape[0] / max(len(lines), 1)
+                cap = max(targets[i], readable_floor)
                 scale = min(cap / max(visible, 1), avail_w / raster.shape[1], avail_h / raster.shape[0])
                 displayed = visible * scale
-                # Never reward extra wrapping that halves readability. Keep at
-                # least 70% of the source ink height when any legal candidate
-                # can do so; among readable candidates prefer source row count.
-                # This fixes 3-10px long Chinese output without expanding the
-                # original footprint or changing pipeline configuration.
-                readable_floor = max(6.0, heights[i] * 0.75)
+                # Production readability floor: retain a meaningful fraction of
+                # the source ink while never emitting microtext. A 1080px-wide
+                # comic needs about 12px visible glyphs for ordinary dialogue;
+                # larger source lettering gets a proportional floor as well.
                 readable = displayed >= readable_floor
-                # Detector rows remain a tie-breaker, not a hard quota. Chinese
-                # often needs fewer rows than English; first maximize legibility,
-                # then prefer fewer rows instead of halving the glyph height just
-                # to mimic every source line.
-                score = (readable, displayed if readable else 0,
-                         -len(lines) if readable else 0,
-                         -abs(len(lines) - original_counts[i]))
+                # Readability is the hard gate. Prefer the source region's own
+                # line count before detector-row hints; then keep as much of the
+                # hinted structure as possible without sacrificing glyph size.
+                source_count = _orig_line_count(region)
+                score = (readable,
+                         -abs(len(lines) - source_count) if readable else 0,
+                         -abs(len(lines) - original_counts[i]) if readable else 0,
+                         displayed, -len(lines))
                 if best is None or score > best[0]:
                     best = (score, raster, scale, len(lines), visible)
         else:
@@ -1224,31 +1333,58 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                 best = ((0, scale, 0), raster, scale, len(runs), visible)
         if best is not None:
             _, raster, scale, count, visible = best
-            plans[i] = (raster, scale, count, visible, (left, top, right, bottom), font)
+            if region.horizontal and visible * scale + 0.01 < readable_floor:
+                region._bubble_layout_failed = (
+                    f'visible ink {visible * scale:.1f}px below {readable_floor:.1f}px floor')
+            else:
+                plans[i] = (raster, scale, count, visible, (left, top, right, bottom), font)
 
-    # A constrained block scales the whole balloon uniformly, preserving the
-    # title/body hierarchy rather than making just one dialogue block tiny.
-    group_scales = {}
-    for i, (_, scale, _, visible, _, _) in plans.items():
-        if text_regions[i].horizontal:
-            ratio = scale * visible / targets[i]
-            group_scales[groups[i]] = min(group_scales.get(groups[i], 1.0), ratio)
-
+    # Resolve real raster collisions inside each physical balloon. Detector/VLM
+    # splits can overlap slightly; keep source ordering and shift within the same
+    # closed component instead of crossing into another bubble or panel.
+    placed = {}
     points = []
     for i, region in enumerate(text_regions):
         region._bubble_raster = None
         if i not in plans:
-            points.append(np.array(region.min_rect, copy=True))
+            # Deliberate fail-closed behavior: do not let the generic renderer
+            # silently emit unreadable 3px text after bubble fitting failed.
+            if getattr(region, '_bubble_layout_failed', None):
+                region._render_lines = 0
+                region._bubble_retained_lines = False if region.horizontal else None
+                region._bubble_visible_ink_height = 0.0
+                cx, cy = (boxes[i][0] + boxes[i][2]) / 2, (boxes[i][1] + boxes[i][3]) / 2
+                points.append(np.array([[[cx, cy], [cx, cy], [cx, cy], [cx, cy]]], dtype=np.int64))
+            else:
+                points.append(np.array(region.min_rect, copy=True))
             continue
         raster, scale, count, visible, bounds, font = plans[i]
-        if region.horizontal:
-            scale = min(scale, targets[i] * group_scales[groups[i]] / visible)
         width = max(1, int(np.floor(raster.shape[1] * scale)))
         height = max(1, int(np.floor(raster.shape[0] * scale)))
         raster = cv2.resize(raster, (width, height), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
         left, top, right, bottom = bounds
         x = left if region.alignment == 'left' else right - width if region.alignment == 'right' else left + (right - left - width) // 2
         y = top + (bottom - top - height) // 2
+        group = physical_groups[i]
+        previous = placed.setdefault(group, [])
+        for px1, py1, px2, py2 in previous:
+            if x < px2 and x + width > px1 and y < py2 and y + height > py1:
+                below, above = py2 + 2, py1 - height - 2
+                if below + height <= bottom:
+                    y = below
+                elif above >= top:
+                    y = above
+                else:
+                    region._bubble_layout_failed = 'no non-overlapping readable placement in bubble'
+                    break
+        if region._bubble_layout_failed:
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            region._render_lines = 0
+            region._bubble_retained_lines = False if region.horizontal else None
+            region._bubble_visible_ink_height = 0.0
+            points.append(np.array([[[cx, cy], [cx, cy], [cx, cy], [cx, cy]]], dtype=np.int64))
+            continue
+        previous.append((x, y, x + width, y + height))
         region.font_size = font
         region._render_lines = count
         region._bubble_retained_lines = count >= original_counts[i] if region.horizontal else None
@@ -1261,6 +1397,11 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                 angle, resample=Image.Resampling.BICUBIC, expand=True)
             raster = np.asarray(rgba)
             height, width = raster.shape[:2]
+            # Rotation enlarges the raster and can reduce visible ink again during
+            # the containment step below. Track actual alpha ink after rotation,
+            # not the nominal pre-rotation line height.
+            alpha_rows = _bubble_ink_runs(raster[:, :, 3])
+            rotated_visible = max(alpha_rows, default=height)
             source_x1, source_y1, source_x2, source_y2 = map(float, region.xyxy)
             contain = min((source_x2-source_x1) / max(width, 1),
                           (source_y2-source_y1) / max(height, 1), 1.0)
@@ -1268,7 +1409,8 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                 width = max(1, int(np.floor(width * contain)))
                 height = max(1, int(np.floor(height * contain)))
                 raster = cv2.resize(raster, (width, height), interpolation=cv2.INTER_AREA)
-                region._bubble_visible_ink_height *= contain
+                rotated_visible *= contain
+            region._bubble_visible_ink_height = float(rotated_visible)
             cx, cy = (source_x1 + source_x2) / 2, (source_y1 + source_y2) / 2
             x, y = int(round(cx - width / 2)), int(round(cy - height / 2))
         region._bubble_raster = (raster, x, y)

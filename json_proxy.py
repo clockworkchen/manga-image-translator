@@ -376,7 +376,9 @@ def _extract_regions_meta(result):
                 "text": getattr(region, "text", None),
                 "translation": getattr(region, "translation", None),
                 "font_size": int(getattr(region, "font_size", 0) or 0),
-                "orig_font_size": int(getattr(region, "_orig_font_size", 0) or 0),
+                "orig_font_size": int(round(float(getattr(
+                    region, "_bubble_source_ink_height",
+                    getattr(region, "_orig_font_size", 0)) or 0))),
                 "alignment": getattr(region, "alignment", None),
                 "fg_color": [int(v) for v in region.get_font_colors()[0]],
                 "bg_color": [int(v) for v in region.get_font_colors()[1]],
@@ -390,6 +392,9 @@ def _extract_regions_meta(result):
                 "bubble_original_lines": getattr(region, "_bubble_original_lines", None),
                 "bubble_retained_lines": getattr(region, "_bubble_retained_lines", None),
                 "bubble_visible_ink_height": getattr(region, "_bubble_visible_ink_height", None),
+                "bubble_boundary_kind": getattr(region, "_bubble_boundary_kind", None),
+                "bubble_bounds": getattr(region, "_bubble_bounds", None),
+                "bubble_layout_failed": getattr(region, "_bubble_layout_failed", None),
             })
         except Exception as e:
             out.append({"id": i, "error": str(e)})
