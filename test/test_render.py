@@ -4,7 +4,11 @@ import cv2
 import pytest
 import numpy as np
 
-from manga_translator.rendering import dispatch as dispatch_rendering, dispatch_eng_render
+from manga_translator.rendering import (
+    dispatch as dispatch_rendering,
+    dispatch_eng_render,
+    _bubble_balanced_lines,
+)
 from manga_translator.utils import (
     TextBlock,
     visualize_textblocks,
@@ -47,3 +51,11 @@ async def test_default_renderer():
 
     img_rendered = await dispatch_rendering(img, regions, hyphenate=False)
     save_result('default1.png', img_rendered, regions)
+
+
+def test_balanced_lines_do_not_create_empty_cjk_rows():
+    lines = _bubble_balanced_lines('我不想脱下来，我要再穿一会儿', 4, 20)
+    assert lines is not None
+    assert len(lines) == 4
+    assert all(line.strip() for line in lines)
+    assert ''.join(lines) == '我不想脱下来，我要再穿一会儿'

@@ -240,6 +240,15 @@ def _merge_region_members(regions, members, boxes):
                               for size in getattr(region, 'ocr_ink_heights', [])]
     merged.ocr_block_ids = set().union(
         *(getattr(region, 'ocr_block_ids', set()) for region in ordered))
+    merged.ocr_detector_rows = sum(
+        int(getattr(region, 'ocr_detector_rows', len(region.lines))) for region in ordered)
+    merged.ocr_source_rows = max(
+        (int(getattr(region, 'ocr_source_rows', 0)) for region in ordered), default=0)
+    merged.ocr_complete_block = all(
+        bool(getattr(region, 'ocr_complete_block', True)) for region in ordered)
+    rects = {getattr(region, 'ocr_block_rect', None) for region in ordered}
+    rects.discard(None)
+    merged.ocr_block_rect = next(iter(rects)) if len(rects) == 1 else None
     return merged
 
 
@@ -275,6 +284,16 @@ def merge_closed_bubble_regions(regions, image):
             continue
         if any(abs(region.angle) > 3 or len(region.lines) != len(region.texts)
                for region in ordered):
+            continue
+        # A complete VLM crop already supplied all detector rows for the block.
+        # If the normal merger still split those rows, block ownership is stronger
+        # evidence than the post-OCR box-height estimate. This is deliberately
+        # local to one crop and does not widen global merge thresholds.
+        same_complete_vlm = all(
+            bool(getattr(region, 'ocr_complete_block', False))
+            and len(getattr(region, 'ocr_block_ids', set())) == 1
+            for region in ordered)
+        if not same_complete_vlm and any(len(region.lines) > 1 for region in ordered):
             continue
         connected = True
         for a, b in zip(members, members[1:]):
@@ -375,6 +394,15 @@ async def dispatch(textlines: List[Quadrilateral], width: int, height: int, verb
         region.ocr_style_heights = [size for line in txtlns for size in _style_heights(line)]
         region.ocr_ink_heights = [float(line.ocr_ink_height) for line in txtlns
                                  if hasattr(line, 'ocr_ink_height')]
+        region.ocr_detector_rows = sum(
+            int(getattr(line, 'ocr_detector_rows', 1)) for line in txtlns)
+        region.ocr_source_rows = max(
+            (int(getattr(line, 'ocr_source_rows', 0)) for line in txtlns), default=0)
+        region.ocr_complete_block = all(
+            bool(getattr(line, 'ocr_complete_block', True)) for line in txtlns)
+        block_rects = {getattr(line, 'ocr_block_rect', None) for line in txtlns}
+        block_rects.discard(None)
+        region.ocr_block_rect = next(iter(block_rects)) if len(block_rects) == 1 else None
         block_ids = {getattr(line, 'ocr_block_id', None) for line in txtlns}
         block_ids.discard(None)
         region.ocr_block_ids = block_ids

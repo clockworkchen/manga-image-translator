@@ -1087,7 +1087,7 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
     for i, region in enumerate(text_regions):
         box = boxes[i]
         heights[i] = max(1.0, _per_line_height(region, box, original_img) / 1.1)
-        count = _orig_line_count(region)
+        count = max(_orig_line_count(region), int(getattr(region, 'ocr_detector_rows', 0)))
         if not region.horizontal:
             # Vertical source size is ink COLUMN width, not row height.
             measured = _measure_ink_height(
@@ -1176,6 +1176,11 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
             balanced = _bubble_balanced_lines(text, original_counts[i], font)
             if balanced:
                 candidates.append(balanced)
+            # Detector rows are a geometric hint, not a quota. A Chinese target
+            # often needs fewer rows than the English source; forcing all source
+            # rows made each glyph tiny. Prefer the fewest rows that still keeps
+            # at least 75% of the measured source ink height, then choose the
+            # closest source-row count only as a tie-breaker.
             seen = set()
             for lines in candidates:
                 if not lines or lines in seen:
@@ -1196,11 +1201,16 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                 # can do so; among readable candidates prefer source row count.
                 # This fixes 3-10px long Chinese output without expanding the
                 # original footprint or changing pipeline configuration.
-                readable_floor = max(6.0, heights[i] * 0.70)
+                readable_floor = max(6.0, heights[i] * 0.75)
                 readable = displayed >= readable_floor
-                retained = min(len(lines), original_counts[i])
-                score = (readable, retained if readable else 0, displayed,
-                         -abs(len(lines) - original_counts[i]))
+                # Keep a sensible source-row floor (roughly half the printed
+                # rows), but do not force every English row onto shorter Chinese.
+                # Within that floor prefer larger readable glyphs.
+                row_floor = min(original_counts[i], max(1, int(np.ceil(original_counts[i] * 0.5))))
+                enough_rows = len(lines) >= row_floor
+                score = (readable, enough_rows if readable else False,
+                         displayed if readable and enough_rows else 0,
+                         -abs(len(lines) - row_floor))
                 if best is None or score > best[0]:
                     best = (score, raster, scale, len(lines), visible)
         else:

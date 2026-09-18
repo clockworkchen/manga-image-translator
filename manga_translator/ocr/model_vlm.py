@@ -133,10 +133,37 @@ class ModelVlmOCR(CommonOCR):
                 if blocked.is_set():
                     raise VlmRequestBlocked('VLM batch stopped after upstream refusal')
                 try:
-                    return await self._ask(base, key, model,
-                                           self._crop(image, rect),
-                                           self._where(image, rect),
-                                           len(members), config.vlm_timeout)
+                    member_heights = []
+                    for index in members:
+                        points = np.asarray(textlines[index].pts).reshape(-1, 2)
+                        member_heights.append(float(points[:, 1].max() - points[:, 1].min()))
+                    line_height = float(np.median(member_heights)) if member_heights else 16.0
+                    crop = self._crop(
+                        image, rect,
+                        pad=(max(8, int(round(line_height * 0.65))),
+                             max(8, int(round(line_height * 0.30)))))
+                    answer = await self._ask(
+                        base, key, model, crop, self._where(image, rect),
+                        len(members), config.vlm_timeout)
+                    # A short answer is the characteristic VLM truncation mode:
+                    # it reads the first visible row and silently drops the rest.
+                    # Retry that block once with more context instead of widening
+                    # detector/merge thresholds for the whole page.
+                    returned = [line for line in str(answer or '').splitlines() if line.strip()]
+                    if len(members) > 1 and len(returned) != len(members):
+                        retry = await self._ask(
+                            base, key, model,
+                            self._crop(
+                                image, rect,
+                                pad=(max(12, int(round(line_height * 1.0))),
+                                     max(10, int(round(line_height * 0.50))))),
+                            self._where(image, rect) +
+                            f'; previous OCR returned {len(returned)} rows, re-check every printed row',
+                            len(members), config.vlm_timeout)
+                        retry_lines = [line for line in str(retry or '').splitlines() if line.strip()]
+                        if abs(len(retry_lines) - len(members)) < abs(len(returned) - len(members)):
+                            answer = retry
+                    return answer
                 except VlmRequestBlocked:
                     blocked.set()
                     raise
@@ -176,9 +203,19 @@ class ModelVlmOCR(CommonOCR):
             if self._is_chrome(image, rect, lines):
                 continue
             member_boxes = [textlines[index] for index in members]
+            # Geometry is detector-owned. When the VLM returns fewer strings than
+            # detector rows, assign text to row groups rather than stretching one
+            # line over the union rectangle. This keeps OCR crop context separate
+            # from render geometry and prevents duplicated/nested fragments.
+            bands, line_groups = self._align_lines_to_detector(image, rect, lines, member_boxes)
             generated = self._split_into_lines(
                 image, rect, lines, self._block_rotation(member_boxes, rect),
-                detected_lines=member_boxes)
+                detected_lines=None, aligned_bands=bands)
+            for line, group in zip(generated, line_groups):
+                line.ocr_detector_rows = int(group)
+                line.ocr_source_rows = len(member_boxes)
+                line.ocr_complete_block = len(lines) == len(member_boxes)
+                line.ocr_block_rect = tuple(float(value) for value in rect)
             for line in generated:
                 line.ocr_block_id = block_id
             out.extend(generated)
@@ -297,12 +334,13 @@ class ModelVlmOCR(CommonOCR):
                 f"{rect[0] / max(1, w) * 100:.0f}% across a {w}x{h} page")
 
     @staticmethod
-    def _crop(image: np.ndarray, rect: List[float], pad: int = 8) -> np.ndarray:
+    def _crop(image: np.ndarray, rect: List[float], pad=8) -> np.ndarray:
         h, w = image.shape[:2]
-        x1 = max(0, int(rect[0]) - pad)
-        y1 = max(0, int(rect[1]) - pad)
-        x2 = min(w, int(rect[2]) + pad)
-        y2 = min(h, int(rect[3]) + pad)
+        pad_x, pad_y = pad if isinstance(pad, tuple) else (pad, pad)
+        x1 = max(0, int(rect[0]) - int(pad_x))
+        y1 = max(0, int(rect[1]) - int(pad_y))
+        x2 = min(w, int(rect[2]) + int(pad_x))
+        y2 = min(h, int(rect[3]) + int(pad_y))
         crop = image[y1:y2, x1:x2]
         if crop.size == 0:
             return np.zeros((8, 8, 3), np.uint8)
@@ -390,7 +428,7 @@ class ModelVlmOCR(CommonOCR):
 
     def _split_into_lines(self, image: np.ndarray, rect: List[float],
                           lines: List[str], rotation: float = 0.0,
-                          detected_lines=None) -> List[Quadrilateral]:
+                          detected_lines=None, aligned_bands=None) -> List[Quadrilateral]:
         """Turn one OCR block into one geometrically grounded quad per line.
 
         Detector lines are the primary geometry. Projection remains a fallback
@@ -399,7 +437,7 @@ class ModelVlmOCR(CommonOCR):
         becoming a separate nested region that overlaps its own bubble.
         """
         style_heights = []
-        bands = self._detected_bands(detected_lines, len(lines))
+        bands = aligned_bands or self._detected_bands(detected_lines, len(lines))
         if bands is None:
             bands = self._ink_bands(image, rect, len(lines), style_heights=style_heights)
         out = []
@@ -435,7 +473,65 @@ class ModelVlmOCR(CommonOCR):
             bands.append((float(pts[:, 0].min()), float(pts[:, 1].min()),
                           float(pts[:, 0].max()), float(pts[:, 1].max())))
         bands.sort(key=lambda box: (box[1], box[0]))
-        return bands
+        return ModelVlmOCR._regularize_vertical_bands(bands)
+
+    @classmethod
+    def _align_lines_to_detector(cls, image, rect, lines, detected_lines):
+        """Map VLM strings onto contiguous detector-row groups.
+
+        Equal slicing of a union crop created synthetic 49-65px "font sizes" on
+        blocks where the VLM returned one string for several detector rows. The
+        groups here preserve the detector's outer geometry and expose the number
+        of source rows carried by each OCR string to the bubble renderer.
+        """
+        bands = cls._detected_bands(detected_lines, len(detected_lines)) or []
+        if not bands or len(lines) >= len(bands):
+            exact = bands if len(lines) == len(bands) else cls._ink_bands(image, rect, len(lines))
+            return exact, [1] * len(lines)
+        count, rows = len(lines), len(bands)
+        weights = [max(1, len(re.sub(r'\s+', '', line))) for line in lines]
+        raw = np.asarray(weights, dtype=float) * rows / max(sum(weights), 1)
+        groups = [max(1, int(np.floor(value))) for value in raw]
+        while sum(groups) < rows:
+            fractions = raw - np.floor(raw)
+            choices = sorted(range(count), key=lambda i: (fractions[i], weights[i]), reverse=True)
+            groups[choices[(sum(groups) - count) % count]] += 1
+        while sum(groups) > rows:
+            choices = sorted((i for i in range(count) if groups[i] > 1),
+                             key=lambda i: (raw[i] - groups[i], weights[i]))
+            if not choices:
+                break
+            groups[choices[0]] -= 1
+        aligned, offset = [], 0
+        for group in groups:
+            owned = bands[offset:offset + group]
+            aligned.append((min(box[0] for box in owned), min(box[1] for box in owned),
+                            max(box[2] for box in owned), max(box[3] for box in owned)))
+            offset += group
+        return aligned, groups
+
+    @staticmethod
+    def _regularize_vertical_bands(bands):
+        """Clip overlapping detector rows at their centroid midpoint.
+
+        Ensemble boxes often overlap by 30-60% vertically. Keeping that overlap
+        duplicates source ink in two OCR rows and later produces intersecting
+        regions. Midpoint boundaries retain every row's centre while making
+        ownership disjoint; horizontal extents remain detector-derived.
+        """
+        if len(bands) < 2:
+            return bands
+        result = [list(box) for box in bands]
+        for i in range(len(result) - 1):
+            upper, lower = result[i], result[i + 1]
+            if upper[3] <= lower[1]:
+                continue
+            upper_center = (upper[1] + upper[3]) / 2
+            lower_center = (lower[1] + lower[3]) / 2
+            boundary = (upper_center + lower_center) / 2
+            upper[3] = max(upper[1] + 1, boundary)
+            lower[1] = min(lower[3] - 1, boundary)
+        return [tuple(box) for box in result]
 
     @staticmethod
     def _extract_line_colors(image: np.ndarray, box: np.ndarray):
