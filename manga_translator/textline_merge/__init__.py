@@ -304,13 +304,18 @@ def merge_stacked_open_regions(regions):
             ax1, ay1, ax2, ay2 = boxes[current]
             candidates = []
             for other in order:
-                if other in used or other in chain or boxes[other][1] < ay2 - 1:
+                if other in used or other in chain:
                     continue
                 bx1, by1, bx2, by2 = boxes[other]
+                scale = max(regions[current].font_size, regions[other].font_size, 1)
+                # OCR boxes for adjacent printed rows may overlap slightly after
+                # crop padding. Allow up to 25% of a line height; larger overlap
+                # remains a real separate/ambiguous region.
+                if by1 < ay2 - scale * 0.25:
+                    continue
                 overlap = min(ax2, bx2) - max(ax1, bx1)
                 gap = by1 - ay2
                 center_delta = abs((ax1 + ax2) - (bx1 + bx2)) / 2
-                scale = max(regions[current].font_size, regions[other].font_size, 1)
                 same_colour = np.linalg.norm(
                     np.asarray(regions[current].get_font_colors()[0], float)
                     - np.asarray(regions[other].get_font_colors()[0], float)) <= 45
@@ -319,7 +324,7 @@ def merge_stacked_open_regions(regions):
                 # the same centre. Require meaningful overlap, but allow 35% when
                 # centring is especially strong; cross-column rows still fail.
                 overlap_requirement = 0.35 if center_delta <= scale * 1.0 else 0.55
-                if (0 <= gap <= scale * 0.9
+                if (-scale * 0.25 <= gap <= scale * 0.9
                         and overlap >= overlap_requirement * min_width
                         and center_delta <= scale * 2.5
                         and abs(regions[current].angle) <= 3 and abs(regions[other].angle) <= 3
