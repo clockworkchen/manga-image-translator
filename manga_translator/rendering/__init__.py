@@ -1124,6 +1124,11 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
             if median * 0.75 <= heights[i] <= median * 1.40:
                 targets[i] = median
 
+    for i, region in enumerate(text_regions):
+        block_ids = getattr(region, 'ocr_block_ids', set())
+        if len(block_ids) == 1:
+            groups[i] = ('vlm', next(iter(block_ids)))
+
     for group in set(groups):
         members = [i for i, g in enumerate(groups) if g == group and text_regions[i].horizontal]
         if len(members) < 2:
@@ -1145,7 +1150,7 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
         right, bottom = min(img.shape[1], int(np.floor(x2 - inset))), min(img.shape[0], int(np.floor(y2)))
         avail_w, avail_h = right - left, bottom - top
         region._orig_font_size = int(region.font_size)
-        region._bubble_group = int(groups[i])
+        region._bubble_group = groups[i] if isinstance(groups[i], int) else str(groups[i][1])
         region._bubble_original_lines = int(original_counts[i])
         if avail_w < 1 or avail_h < 1:
             continue
@@ -1185,10 +1190,17 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                 visible = max(runs, default=raster.shape[0])
                 cap = min(targets[i], heights[i] * 1.10)
                 scale = min(cap / max(visible, 1), avail_w / raster.shape[1], avail_h / raster.shape[0])
-                # Hard containment and ink cap always win. Among feasible
-                # wraps prefer source row count, then largest readable scale.
+                displayed = visible * scale
+                # Never reward extra wrapping that halves readability. Keep at
+                # least 70% of the source ink height when any legal candidate
+                # can do so; among readable candidates prefer source row count.
+                # This fixes 3-10px long Chinese output without expanding the
+                # original footprint or changing pipeline configuration.
+                readable_floor = max(6.0, heights[i] * 0.70)
+                readable = displayed >= readable_floor
                 retained = min(len(lines), original_counts[i])
-                score = (retained, scale, -abs(len(lines) - original_counts[i]))
+                score = (readable, retained if readable else 0, displayed,
+                         -abs(len(lines) - original_counts[i]))
                 if best is None or score > best[0]:
                     best = (score, raster, scale, len(lines), visible)
         else:

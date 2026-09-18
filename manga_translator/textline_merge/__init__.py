@@ -238,6 +238,8 @@ def _merge_region_members(regions, members, boxes):
     merged.ocr_style_heights = [size for region in ordered for size in _style_heights(region)]
     merged.ocr_ink_heights = [size for region in ordered
                               for size in getattr(region, 'ocr_ink_heights', [])]
+    merged.ocr_block_ids = set().union(
+        *(getattr(region, 'ocr_block_ids', set()) for region in ordered))
     return merged
 
 
@@ -251,6 +253,14 @@ def merge_closed_bubble_regions(regions, image):
 
     boxes = [_aabb_of(region.min_rect) for region in regions]
     groups = _bubble_groups(image, boxes)
+    # VLM crop membership is stronger ownership evidence than flood-filled
+    # balloon components, which often split at glyph holes or hand-drawn gaps.
+    # It does not relax any distance/style rule below; it only supplies the
+    # candidate set, avoiding the failed global-threshold experiments.
+    for i, region in enumerate(regions):
+        block_ids = getattr(region, 'ocr_block_ids', set())
+        if len(block_ids) == 1:
+            groups[i] = ('vlm', next(iter(block_ids)))
     replacements, removed = {}, set()
     for group in set(groups):
         members = [i for i, value in enumerate(groups) if value == group]
@@ -365,5 +375,8 @@ async def dispatch(textlines: List[Quadrilateral], width: int, height: int, verb
         region.ocr_style_heights = [size for line in txtlns for size in _style_heights(line)]
         region.ocr_ink_heights = [float(line.ocr_ink_height) for line in txtlns
                                  if hasattr(line, 'ocr_ink_height')]
+        block_ids = {getattr(line, 'ocr_block_id', None) for line in txtlns}
+        block_ids.discard(None)
+        region.ocr_block_ids = block_ids
         text_regions.append(region)
     return text_regions

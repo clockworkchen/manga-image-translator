@@ -51,11 +51,14 @@ from ..utils import Quadrilateral
 _PROMPT = """You are an OCR engine for comic/manga pages.
 
 The image is one text area cropped from a comic page, {hint}. It is usually a
-speech bubble or a caption. Transcribe its text EXACTLY as printed.
+speech bubble or a caption. The detector found {expected_lines} separate line
+band(s) in this crop. Transcribe its text EXACTLY as printed.
 
 Rules:
-1. Return one array entry per printed line. If the crop shows three lines of
-   text, return three entries, in reading order.
+1. Return one array entry per printed line, in reading order. The detector line
+   count is geometric evidence: normally return exactly {expected_lines}
+   entries. Do not join a short middle line into either neighbour and do not
+   omit a line merely because it overlaps another detector box.
 2. Transcribe verbatim. Do not translate, correct spelling, expand
    abbreviations, or add punctuation that is not there.
 3. Keep the original capitalisation.
@@ -110,7 +113,8 @@ class ModelVlmOCR(CommonOCR):
         # which then renders on top of itself. One crop per bubble contains each
         # line exactly once, and the VLM reports the line breaks, which is what
         # the renderer needs to avoid collapsing the translation onto one line.
-        blocks = self._group_boxes(textlines)
+        block_members = self._group_box_members(textlines)
+        blocks = [block[0] for block in block_members]
 
         # One request per block, concurrently. Batching many crops into a single
         # request and matching answers by index looked cheaper but is unsafe: on
@@ -122,8 +126,9 @@ class ModelVlmOCR(CommonOCR):
         failures = 0
         blocked = asyncio.Event()
 
-        async def one(rect):
+        async def one(block):
             nonlocal failures
+            rect, members = block
             async with sem:
                 if blocked.is_set():
                     raise VlmRequestBlocked('VLM batch stopped after upstream refusal')
@@ -131,7 +136,7 @@ class ModelVlmOCR(CommonOCR):
                     return await self._ask(base, key, model,
                                            self._crop(image, rect),
                                            self._where(image, rect),
-                                           config.vlm_timeout)
+                                           len(members), config.vlm_timeout)
                 except VlmRequestBlocked:
                     blocked.set()
                     raise
@@ -140,7 +145,7 @@ class ModelVlmOCR(CommonOCR):
                     self.logger.warning(f"vlm ocr: block failed ({e})")
                     return None
 
-        tasks = [asyncio.create_task(one(rect)) for rect in blocks]
+        tasks = [asyncio.create_task(one(block)) for block in block_members]
         try:
             texts = await asyncio.gather(*tasks)
         except BaseException:
@@ -154,17 +159,11 @@ class ModelVlmOCR(CommonOCR):
             return await self._run_fallback(image, textlines, config, verbose)
 
         out: List[Quadrilateral] = []
-        for rect, crop_text in zip(blocks, texts):
+        for block_id, ((rect, members), crop_text) in enumerate(zip(block_members, texts)):
             if crop_text is None:
                 # A transport/parse failure is not evidence of an empty bubble.
                 # Never silently discard it while returning a successful page.
-                x1, y1, x2, y2 = rect
-                affected = []
-                for detected in textlines:
-                    pts = np.asarray(detected.pts).reshape(-1, 2)
-                    if (pts[:, 0].min() >= x1 and pts[:, 0].max() <= x2
-                            and pts[:, 1].min() >= y1 and pts[:, 1].max() <= y2):
-                        affected.append(detected)
+                affected = [textlines[index] for index in members]
                 recovered = await self._run_fallback(image, affected, config, verbose)
                 if not recovered:
                     raise RuntimeError('VLM OCR block failed and fallback recovered no text')
@@ -176,8 +175,13 @@ class ModelVlmOCR(CommonOCR):
                 continue
             if self._is_chrome(image, rect, lines):
                 continue
-            out.extend(self._split_into_lines(image, rect, lines,
-                                              self._block_rotation(textlines, rect)))
+            member_boxes = [textlines[index] for index in members]
+            generated = self._split_into_lines(
+                image, rect, lines, self._block_rotation(member_boxes, rect),
+                detected_lines=member_boxes)
+            for line in generated:
+                line.ocr_block_id = block_id
+            out.extend(generated)
         self.logger.info(f"vlm ocr: {len(textlines)} boxes -> {len(blocks)} blocks "
                          f"-> {len(out)} lines")
         return out
@@ -190,14 +194,19 @@ class ModelVlmOCR(CommonOCR):
             await self._fallback.load("cpu")
         return await self._fallback.recognize(image, textlines, config, verbose)
 
-    @staticmethod
-    def _group_boxes(textlines: List[Quadrilateral]) -> List[List[float]]:
-        """Union detection boxes that belong to the same block of text.
+    @classmethod
+    def _group_boxes(cls, textlines: List[Quadrilateral]) -> List[List[float]]:
+        """Backward-compatible geometry-only view used by detector diagnostics."""
+        return [rect for rect, _ in cls._group_box_members(textlines)]
 
-        Grouping is on generously grown rects rather than raw overlap because
-        the boxes for consecutive lines of one bubble frequently do not touch at
-        all - the detector clips them tight to the ink - while still overlapping
-        each other's content once padded for the crop.
+    @staticmethod
+    def _group_box_members(textlines: List[Quadrilateral]):
+        """Union detector lines and retain exact membership for OCR alignment.
+
+        Keeping the member indices is essential: containment against a union
+        rectangle also catches unrelated nested/overlapping detections. That was
+        how a three-line bubble became a two-line OCR region plus a duplicated
+        one-line fragment, producing the production R0/R1 overlap.
         """
         rects = []
         for t in textlines:
@@ -241,14 +250,17 @@ class ModelVlmOCR(CommonOCR):
 
         groups = {}
         for i in range(n):
-            groups.setdefault(find(i), []).append(rects[i])
+            groups.setdefault(find(i), []).append(i)
         out = []
-        for members in groups.values():
-            out.append([min(r[0] for r in members), min(r[1] for r in members),
-                        max(r[2] for r in members), max(r[3] for r in members)])
+        for member_indices in groups.values():
+            member_indices.sort(key=lambda index: (rects[index][1], rects[index][0]))
+            members = [rects[index] for index in member_indices]
+            rect = [min(r[0] for r in members), min(r[1] for r in members),
+                    max(r[2] for r in members), max(r[3] for r in members)]
+            out.append((rect, member_indices))
         # Reading order, so batches stay locally coherent and the returned JSON
         # is easy to line up against the page when debugging.
-        out.sort(key=lambda r: (r[1], r[0]))
+        out.sort(key=lambda item: (item[0][1], item[0][0]))
         return out
 
     @staticmethod
@@ -303,7 +315,7 @@ class ModelVlmOCR(CommonOCR):
         return crop
 
     async def _ask(self, base: str, key: Optional[str], model: str,
-                   crop: np.ndarray, hint: str,
+                   crop: np.ndarray, hint: str, expected_lines: int,
                    configured_timeout: Optional[float] = None) -> Optional[str]:
         import httpx
 
@@ -312,7 +324,8 @@ class ModelVlmOCR(CommonOCR):
             return None
         b64 = base64.b64encode(buf.tobytes()).decode("ascii")
         content = [
-            {"type": "text", "text": _PROMPT.format(hint=hint)},
+            {"type": "text", "text": _PROMPT.format(
+                hint=hint, expected_lines=max(1, int(expected_lines)))},
             {"type": "image_url",
              "image_url": {"url": f"data:image/png;base64,{b64}"}},
         ]
@@ -376,16 +389,19 @@ class ModelVlmOCR(CommonOCR):
         return float(np.median(values)) if values else 0.0
 
     def _split_into_lines(self, image: np.ndarray, rect: List[float],
-                          lines: List[str], rotation: float = 0.0) -> List[Quadrilateral]:
-        """Turn one block holding `len(lines)` printed lines into one quad per line.
+                          lines: List[str], rotation: float = 0.0,
+                          detected_lines=None) -> List[Quadrilateral]:
+        """Turn one OCR block into one geometrically grounded quad per line.
 
-        Downstream everything assumes a Quadrilateral is a single line: the merge
-        step groups lines into blocks and the renderer counts them to decide how
-        many lines the translation may occupy. Splitting here is what lets a
-        three-line bubble stay three lines.
+        Detector lines are the primary geometry. Projection remains a fallback
+        only when OCR and detector counts disagree. This avoids assigning the
+        full crop width to every VLM line and prevents a short middle line from
+        becoming a separate nested region that overlaps its own bubble.
         """
         style_heights = []
-        bands = self._ink_bands(image, rect, len(lines), style_heights=style_heights)
+        bands = self._detected_bands(detected_lines, len(lines))
+        if bands is None:
+            bands = self._ink_bands(image, rect, len(lines), style_heights=style_heights)
         out = []
         for i, (text, (bx1, by1, bx2, by2)) in enumerate(zip(lines, bands)):
             box = np.array([[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]],
@@ -402,11 +418,24 @@ class ModelVlmOCR(CommonOCR):
             line.bg_r, line.bg_g, line.bg_b = (int(value) for value in bg)
             # Equal-slice fallback has no measured style evidence. Do not label
             # its guessed height as a real font boundary.
+            line.ocr_ink_height = float(by2 - by1)
             if style_heights:
-                line.ocr_ink_height = float(by2 - by1)
                 line.ocr_style_height = style_heights[i]
             out.append(line)
         return out
+
+    @staticmethod
+    def _detected_bands(detected_lines, count):
+        """Return exact detector boxes when they map one-to-one to VLM lines."""
+        if not detected_lines or len(detected_lines) != count:
+            return None
+        bands = []
+        for detected in detected_lines:
+            pts = np.asarray(detected.pts).reshape(-1, 2).astype(float)
+            bands.append((float(pts[:, 0].min()), float(pts[:, 1].min()),
+                          float(pts[:, 0].max()), float(pts[:, 1].max())))
+        bands.sort(key=lambda box: (box[1], box[0]))
+        return bands
 
     @staticmethod
     def _extract_line_colors(image: np.ndarray, box: np.ndarray):
