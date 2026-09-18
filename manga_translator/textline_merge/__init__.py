@@ -262,19 +262,7 @@ def merge_closed_bubble_regions(regions, image):
             continue
         sizes = [float(region.font_size) for region in ordered]
         if min(sizes) <= 0 or max(sizes) / min(sizes) > 1.15:
-            # VLM can split one printed sentence into overlapping fragments with
-            # noisy box heights (e.g. 22px + 12px). Inside the same proven closed
-            # bubble, strong horizontal overlap and actual vertical overlap are
-            # better ownership evidence than the estimated sizes.
-            if len(members) != 2:
-                continue
-            a, b = members
-            ax1, ay1, ax2, ay2 = boxes[a]
-            bx1, by1, bx2, by2 = boxes[b]
-            overlap = min(ax2, bx2) - max(ax1, bx1)
-            vertical_overlap = min(ay2, by2) - max(ay1, by1)
-            if overlap < 0.75 * min(ax2-ax1, bx2-bx1) or vertical_overlap <= 0:
-                continue
+            continue
         if any(abs(region.angle) > 3 or len(region.lines) != len(region.texts)
                for region in ordered):
             continue
@@ -285,8 +273,7 @@ def merge_closed_bubble_regions(regions, image):
             overlap = min(ax2, bx2) - max(ax1, bx1)
             gap = by1 - ay2
             if (overlap < 0.5 * min(ax2 - ax1, bx2 - bx1)
-                    or gap < -0.75 * min(ay2-ay1, by2-by1)
-                    or gap > 1.5 * max(sizes)):
+                    or gap < -1 or gap > 1.5 * max(sizes)):
                 connected = False
                 break
         if not connected:
