@@ -56,7 +56,14 @@ class CustomOpenAiTranslator(ConfigGPT, CommonTranslator):
         ConfigGPT.__init__(self, config_key=_CONFIG_KEY)
         self.model = model
         CommonTranslator.__init__(self)
-        self.client = openai.AsyncOpenAI(api_key=api_key or CUSTOM_OPENAI_API_KEY or "ollama", max_retries=0) # required, but unused for ollama
+        self.client = openai.AsyncOpenAI(
+            api_key=api_key or CUSTOM_OPENAI_API_KEY or "ollama",
+            max_retries=0,
+            # The relay may briefly refuse TCP connections while rotating an
+            # upstream credential. The default 5s connect timeout made a whole
+            # page fail even though the same endpoint recovered seconds later.
+            timeout=openai.Timeout(180.0, connect=30.0),
+        )
         self.client.base_url = api_base or CUSTOM_OPENAI_API_BASE
         self.token_count = 0
         self.token_count_last = 0
@@ -240,6 +247,14 @@ class CustomOpenAiTranslator(ConfigGPT, CommonTranslator):
                     self.logger.warning(
                         f'Restarting request due to ratelimiting by Ollama servers. Attempt: {ratelimit_attempt}')
                     await asyncio.sleep(2)
+                except (openai.APIConnectionError, openai.APITimeoutError) as exc:
+                    server_error_attempt += 1
+                    if server_error_attempt >= self._RETRY_ATTEMPTS:
+                        raise
+                    self.logger.warning(
+                        'Restarting translation after transient upstream connection error. Attempt: %s',
+                        server_error_attempt)
+                    await asyncio.sleep(min(2 * server_error_attempt, 6))
                 except openai.APIError as exc:
                     if any(marker in str(exc).lower() for marker in (
                             'safety_check_type_csam', 'content_policy_violation',
