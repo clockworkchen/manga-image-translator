@@ -1113,6 +1113,17 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
         original_counts[i] = count
 
     targets = heights.copy()
+    # A page made of many parallel one-line labels is typographic UI/caption
+    # content, not independent speech balloons. Detection/VLM box padding made
+    # one row 36px while its peers were 26-28px. Normalize the obvious body rows
+    # before fitting, while preserving genuine title/body hierarchy elsewhere.
+    horizontal = [i for i, region in enumerate(text_regions) if region.horizontal]
+    if len(horizontal) >= 5 and all(original_counts[i] == 1 for i in horizontal):
+        median = float(np.median([heights[i] for i in horizontal]))
+        for i in horizontal:
+            if median * 0.75 <= heights[i] <= median * 1.40:
+                targets[i] = median
+
     for group in set(groups):
         members = [i for i, g in enumerate(groups) if g == group and text_regions[i].horizontal]
         if len(members) < 2:

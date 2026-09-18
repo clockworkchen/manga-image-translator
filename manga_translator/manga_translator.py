@@ -1060,6 +1060,31 @@ class MangaTranslator:
         )
 
     @staticmethod
+    def _preserve_bracket_structure(source: str, translation: str) -> str:
+        """Restore one leading 【...】 group when the translator drops/moves it.
+
+        This is a layout constraint, not a translation rewrite. If the source
+        begins with a bracketed label and the target still contains a bracket
+        group, normalize it to the front. If brackets were dropped entirely,
+        wrap the target phrase before a short causative suffix such as 让做/让其做.
+        """
+        source = str(source or '').strip()
+        translation = str(translation or '').strip()
+        if not re.match(r'^【[^】]+】', source):
+            return translation
+        group = re.search(r'【\s*([^】]+?)\s*】', translation)
+        if group:
+            label = group.group(1).strip()
+            rest = (translation[:group.start()] + translation[group.end():]).strip()
+            return f'【{label}】{rest}'
+        suffix = re.search(r'(让(?:她|他|其)?做.*)$', translation)
+        if suffix and suffix.start() > 0:
+            label = translation[:suffix.start()].strip(' ，,。')
+            if label:
+                return f'【{label}】{suffix.group(1)}'
+        return f'【{translation}】' if translation else translation
+
+    @staticmethod
     def _preserve_leading_bracket_group(source: str, translation: str) -> str:
         """Keep a source-leading 【…】 label before translated trailing grammar.
 
@@ -1142,6 +1167,7 @@ class MangaTranslator:
                 elif config.render.lowercase:  
                     translation = translation.lower()  # 修正：应该是lower而不是upper  
                 translation = self._preserve_leading_bracket_group(region.text, translation)
+                translation = self._preserve_bracket_structure(region.text, translation)
                 region.translation = translation  
                 region.target_lang = config.translator.target_lang  
                 region._alignment = config.render.alignment  

@@ -75,14 +75,20 @@ def ensure_line_ink_coverage(final_mask: np.ndarray, raw_image: np.ndarray,
             if x2 - x1 < 4 or y2 - y1 < 4:
                 continue
             crop = raw_image[y1:y2, x1:x2]
-            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.ndim == 3 else crop
-            _, threshold = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            dark, light = threshold == 0, threshold == 255
-            ink = dark if dark.sum() <= light.sum() else light
+            pixels = crop.reshape(-1, crop.shape[-1]).astype(np.float32)
+            # Coloured antialiased lettering can have the same luminance as its
+            # dark background, so grayscale Otsu misses the halo. K-means in RGB
+            # separates the two dominant colour populations; the smaller one is
+            # the glyph ink in these tight OCR line boxes.
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
+            _, labels, _ = cv2.kmeans(pixels, 2, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+            labels = labels.reshape(crop.shape[:2])
+            counts = np.bincount(labels.ravel(), minlength=2)
+            ink = labels == int(np.argmin(counts))
             ratio = float(ink.mean())
-            if ratio < 0.01 or ratio > 0.45:
+            if ratio < 0.01 or ratio > 0.48:
                 continue
-            ink = cv2.dilate(ink.astype(np.uint8) * 255, np.ones((3, 3), np.uint8))
+            ink = cv2.dilate(ink.astype(np.uint8) * 255, np.ones((5, 5), np.uint8))
             extra[y1:y2, x1:x2] = np.maximum(extra[y1:y2, x1:x2], ink)
     return cv2.bitwise_or(final_mask, extra)
 
