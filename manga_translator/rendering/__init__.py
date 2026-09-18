@@ -1203,14 +1203,13 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                 # original footprint or changing pipeline configuration.
                 readable_floor = max(6.0, heights[i] * 0.75)
                 readable = displayed >= readable_floor
-                # Keep a sensible source-row floor (roughly half the printed
-                # rows), but do not force every English row onto shorter Chinese.
-                # Within that floor prefer larger readable glyphs.
-                row_floor = min(original_counts[i], max(1, int(np.ceil(original_counts[i] * 0.5))))
-                enough_rows = len(lines) >= row_floor
-                score = (readable, enough_rows if readable else False,
-                         displayed if readable and enough_rows else 0,
-                         -abs(len(lines) - row_floor))
+                # Detector rows remain a tie-breaker, not a hard quota. Chinese
+                # often needs fewer rows than English; first maximize legibility,
+                # then prefer fewer rows instead of halving the glyph height just
+                # to mimic every source line.
+                score = (readable, displayed if readable else 0,
+                         -len(lines) if readable else 0,
+                         -abs(len(lines) - original_counts[i]))
                 if best is None or score > best[0]:
                     best = (score, raster, scale, len(lines), visible)
         else:
