@@ -1366,9 +1366,17 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
         x = left if region.alignment == 'left' else right - width if region.alignment == 'right' else left + (right - left - width) // 2
         y = top + (bottom - top - height) // 2
         group = physical_groups[i]
+        # Source blocks that already overlap substantially are alternative OCR
+        # interpretations/style fragments, not two independent labels requiring
+        # collision separation. Preserve their source-band placement; only move
+        # genuinely separate blocks that the expanded layout brought together.
         previous = placed.setdefault(group, [])
-        for px1, py1, px2, py2 in previous:
-            if x < px2 and x + width > px1 and y < py2 and y + height > py1:
+        for j, px1, py1, px2, py2 in previous:
+            sx1, sy1, sx2, sy2 = boxes[j]
+            source_overlap = (min(x2, sx2) - max(x1, sx1) > 0 and
+                              min(y2, sy2) - max(y1, sy1) > 0)
+            if (not source_overlap and x < px2 and x + width > px1
+                    and y < py2 and y + height > py1):
                 below, above = py2 + 2, py1 - height - 2
                 if below + height <= bottom:
                     y = below
@@ -1384,7 +1392,7 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
             region._bubble_visible_ink_height = 0.0
             points.append(np.array([[[cx, cy], [cx, cy], [cx, cy], [cx, cy]]], dtype=np.int64))
             continue
-        previous.append((x, y, x + width, y + height))
+        previous.append((i, x, y, x + width, y + height))
         region.font_size = font
         region._render_lines = count
         region._bubble_retained_lines = count >= original_counts[i] if region.horizontal else None
