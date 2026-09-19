@@ -1421,10 +1421,33 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
             sx1, sy1, sx2, sy2 = boxes[j]
             source_ox = min(source_x2, sx2) - max(source_x1, sx1)
             source_oy = min(source_y2, sy2) - max(source_y1, sy1)
+            current_norm = re.sub(r'\s+', '', str(region.text or '')).casefold()
+            previous_norm = re.sub(r'\s+', '', str(text_regions[j].text or '')).casefold()
+            same_fragment_text = bool(
+                current_norm and previous_norm
+                and (current_norm in previous_norm or previous_norm in current_norm)
+            )
             source_overlap = (
-                source_ox > 0.85 * min(source_x2 - source_x1, sx2 - sx1)
+                same_fragment_text
+                and source_ox > 0.85 * min(source_x2 - source_x1, sx2 - sx1)
                 and source_oy > 0.30 * min(source_y2 - source_y1, sy2 - sy1)
             )
+            previous_nested_duplicate = (
+                previous_norm and previous_norm in current_norm
+                and sx1 >= source_x1 and sx2 <= source_x2
+                and sy1 >= source_y1 and sy2 <= source_y2
+                and (sx2 - sx1) * (sy2 - sy1)
+                    < (source_x2 - source_x1) * (source_y2 - source_y1) * 0.35
+            )
+            if previous_nested_duplicate:
+                # The broad VLM block already owns this exact nested phrase. Keep
+                # metadata for the small detector fragment but render it only once.
+                marker_h = max(1, int(round(getattr(text_regions[j], '_bubble_visible_ink_height', 1))))
+                text_regions[j]._bubble_raster = (
+                    np.zeros((marker_h, 1, 4), dtype=np.uint8), int(round(sx1)), int(round(sy1)))
+                points[j] = np.array([[[sx1, sy1], [sx1 + 1, sy1],
+                                       [sx1 + 1, sy1 + marker_h], [sx1, sy1 + marker_h]]],
+                                     dtype=np.int64)
             if (not source_overlap and x < px2 and x + width > px1
                     and y < py2 and y + height > py1):
                 below, above = py2 + 2, py1 - height - 2
@@ -1453,10 +1476,35 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                 sx1, sy1, sx2, sy2 = boxes[j]
                 source_ox = min(source_x2, sx2) - max(source_x1, sx1)
                 source_oy = min(source_y2, sy2) - max(source_y1, sy1)
+                current_norm = re.sub(r'\s+', '', str(region.text or '')).casefold()
+                previous_norm = re.sub(r'\s+', '', str(text_regions[j].text or '')).casefold()
+                same_fragment_text = bool(
+                    current_norm and previous_norm
+                    and (current_norm in previous_norm or previous_norm in current_norm)
+                )
                 source_overlap = (
-                    source_ox > 0.85 * min(source_x2 - source_x1, sx2 - sx1)
+                    same_fragment_text
+                    and source_ox > 0.85 * min(source_x2 - source_x1, sx2 - sx1)
                     and source_oy > 0.30 * min(source_y2 - source_y1, sy2 - sy1)
                 )
+                previous_nested_duplicate = (
+                    previous_norm and previous_norm in current_norm
+                    and sx1 >= source_x1 and sx2 <= source_x2
+                    and sy1 >= source_y1 and sy2 <= source_y2
+                    and (sx2 - sx1) * (sy2 - sy1)
+                        < (source_x2 - source_x1) * (source_y2 - source_y1) * 0.35
+                )
+                if previous_nested_duplicate:
+                    marker_h = max(1, int(round(getattr(
+                        text_regions[j], '_bubble_visible_ink_height', 1))))
+                    text_regions[j]._bubble_raster = (
+                        np.zeros((marker_h, 1, 4), dtype=np.uint8),
+                        int(round(sx1)), int(round(sy1)))
+                    points[j] = np.array(
+                        [[[sx1, sy1], [sx1 + 1, sy1],
+                          [sx1 + 1, sy1 + marker_h], [sx1, sy1 + marker_h]]],
+                        dtype=np.int64)
+                    px1, py1, px2, py2 = sx1, sy1, sx1 + 1, sy1 + marker_h
                 if (not source_overlap and x < px2 and x + width > px1
                         and y < py2 and y + height > py1):
                     below, above = py2 + 2, py1 - height - 2
