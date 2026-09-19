@@ -1240,8 +1240,33 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
         avail_w, avail_h = right - left, bottom - top
         # Diagnostics and ratio floors must use measured source ink, not the
         # detector's padded box-height font estimate (observed false 58/65px).
-        region._orig_font_size = int(round(max(heights[i], 1.0)))
-        region._bubble_source_ink_height = float(max(heights[i], 1.0))
+        source_ink = float(max(heights[i], 1.0))
+        # A single-line translation can be width-limited by its original label
+        # footprint even when the detector's padded height is much larger. Cap
+        # diagnostics to the largest source-equivalent glyph size that the same
+        # safe rectangle can physically support.
+        if original_counts[i] == 1 and region.horizontal:
+            source_text = text_render.compact_special_symbols(str(region.text or '').strip())
+            if source_text:
+                try:
+                    source_font = max(6, int(np.ceil(source_ink)))
+                    source_raster = text_render.put_text_horizontal(
+                        source_font, source_text, max(avail_w, source_font * 2), avail_h,
+                        region.alignment, region.direction == 'hl', (255, 255, 255), None,
+                        region.target_lang, hyphenate, line_spacing,
+                        prewrapped_lines=(source_text,))
+                    if source_raster is not None and source_raster.size:
+                        source_runs = _bubble_ink_runs(source_raster[:, :, 3])
+                        source_visible = max(source_runs, default=source_raster.shape[0])
+                        source_scale = min(1.0, avail_w / source_raster.shape[1],
+                                           avail_h / source_raster.shape[0])
+                        source_ink = min(source_ink, source_visible * source_scale)
+                except Exception:
+                    pass
+        heights[i] = max(source_ink, 1.0)
+        targets[i] = min(targets[i], heights[i])
+        region._orig_font_size = int(round(heights[i]))
+        region._bubble_source_ink_height = float(heights[i])
         region._bubble_group = groups[i] if isinstance(groups[i], int) else str(groups[i][1])
         region._bubble_original_lines = int(original_counts[i])
         region._bubble_boundary_kind = boundary_kind
@@ -1255,15 +1280,15 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
         text = text_render.compact_special_symbols(region.get_translation_for_rendering())
         if not text.strip():
             continue
-        # 12px is the absolute floor at 1080px page width. Preserve at least
-        # 55% of source size when the balloon permits it, but do not reject a
-        # geometrically unavoidable 12px rendering merely because the source was
-        # decorative 26px lettering in a 44px-wide bubble.
+        # Preserve genuinely small source lettering instead of imposing a 12px
+        # floor that cannot fit its original footprint. Ordinary dialogue still
+        # keeps at least 60% of its measured source ink; tiny labels keep their
+        # own hierarchy, with a 4px floor only when the source is at least 4px.
         ratio_floor = min(18.0, max(heights[i], 1.0) * 0.60)
-        # Tiny/narrow balloons physically cannot preserve the ratio floor. In
-        # that case 12px remains the non-negotiable production minimum; the fit
-        # still fails closed if even 12px cannot be contained.
-        readable_floor = max(12.0, min(ratio_floor, avail_h * 0.48, avail_w * 0.32))
+        readable_floor = max(
+            min(4.0, heights[i]),
+            min(ratio_floor, avail_h * 0.48, avail_w * 0.32),
+        )
         font = max(6, int(np.ceil(max(targets[i], readable_floor))))
         best = None
         if region.horizontal:
@@ -1366,15 +1391,40 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
         x = left if region.alignment == 'left' else right - width if region.alignment == 'right' else left + (right - left - width) // 2
         y = top + (bottom - top - height) // 2
         group = physical_groups[i]
+        source_x1, source_y1, source_x2, source_y2 = boxes[i]
+        # Reserve strongly nested, separately-worded labels before placing a broad
+        # parent block. UI command hints can sit inside the parent's detector AABB
+        # without being OCR duplicates; placing the parent first would cover them.
+        current_norm = re.sub(r'\s+', '', str(region.text or '')).casefold()
+        current_area = max((source_x2 - source_x1) * (source_y2 - source_y1), 1)
+        for j in range(i + 1, len(boxes)):
+            fx1, fy1, fx2, fy2 = boxes[j]
+            future_area = max((fx2 - fx1) * (fy2 - fy1), 1)
+            future_norm = re.sub(r'\s+', '', str(text_regions[j].text or '')).casefold()
+            nested = (fx1 >= source_x1 and fx2 <= source_x2
+                      and fy1 >= source_y1 and fy2 <= source_y2
+                      and future_area < current_area * 0.35)
+            distinct = future_norm and future_norm not in current_norm
+            if nested and distinct and x < fx2 and x + width > fx1 and y < fy2 and y + height > fy1:
+                above, below = int(np.floor(fy1 - height - 2)), int(np.ceil(fy2 + 2))
+                if above >= top:
+                    y = above
+                elif below + height <= bottom:
+                    y = below
         # Source blocks that already overlap substantially are alternative OCR
         # interpretations/style fragments, not two independent labels requiring
         # collision separation. Preserve their source-band placement; only move
         # genuinely separate blocks that the expanded layout brought together.
         previous = placed.setdefault(group, [])
+        source_x1, source_y1, source_x2, source_y2 = boxes[i]
         for j, px1, py1, px2, py2 in previous:
             sx1, sy1, sx2, sy2 = boxes[j]
-            source_overlap = (min(x2, sx2) - max(x1, sx1) > 0 and
-                              min(y2, sy2) - max(y1, sy1) > 0)
+            source_ox = min(source_x2, sx2) - max(source_x1, sx1)
+            source_oy = min(source_y2, sy2) - max(source_y1, sy1)
+            source_overlap = (
+                source_ox > 0.85 * min(source_x2 - source_x1, sx2 - sx1)
+                and source_oy > 0.30 * min(source_y2 - source_y1, sy2 - sy1)
+            )
             if (not source_overlap and x < px2 and x + width > px1
                     and y < py2 and y + height > py1):
                 below, above = py2 + 2, py1 - height - 2
@@ -1387,6 +1437,40 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                     break
         if region._bubble_layout_failed:
             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            region._render_lines = 0
+            region._bubble_retained_lines = False if region.horizontal else None
+            region._bubble_visible_ink_height = 0.0
+            points.append(np.array([[[cx, cy], [cx, cy], [cx, cy], [cx, cy]]], dtype=np.int64))
+            continue
+        # Source-component grouping is intentionally conservative and can split
+        # adjacent labels that still share pixels after fitting. Enforce a final
+        # global non-overlap pass without moving pre-existing source overlaps.
+        source_x1, source_y1, source_x2, source_y2 = boxes[i]
+        for other_group, other_boxes in placed.items():
+            if other_group == group:
+                continue
+            for j, px1, py1, px2, py2 in other_boxes:
+                sx1, sy1, sx2, sy2 = boxes[j]
+                source_ox = min(source_x2, sx2) - max(source_x1, sx1)
+                source_oy = min(source_y2, sy2) - max(source_y1, sy1)
+                source_overlap = (
+                    source_ox > 0.85 * min(source_x2 - source_x1, sx2 - sx1)
+                    and source_oy > 0.30 * min(source_y2 - source_y1, sy2 - sy1)
+                )
+                if (not source_overlap and x < px2 and x + width > px1
+                        and y < py2 and y + height > py1):
+                    below, above = py2 + 2, py1 - height - 2
+                    if below + height <= bottom:
+                        y = below
+                    elif above >= top:
+                        y = above
+                    else:
+                        region._bubble_layout_failed = 'no global non-overlapping readable placement'
+                        break
+            if region._bubble_layout_failed:
+                break
+        if region._bubble_layout_failed:
+            cx, cy = (source_x1 + source_x2) / 2, (source_y1 + source_y2) / 2
             region._render_lines = 0
             region._bubble_retained_lines = False if region.horizontal else None
             region._bubble_visible_ink_height = 0.0

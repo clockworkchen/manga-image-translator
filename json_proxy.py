@@ -371,6 +371,17 @@ def _extract_regions_meta(result):
             # box the translated text is actually warped into. This is the real
             # ground truth for overlap and displayed-size checks.
             render_box = _aabb(getattr(region, "_render_dst", None))
+            visible_ink = getattr(region, "_bubble_visible_ink_height", None)
+            render_lines = int(getattr(region, "_render_lines", 0) or 0) or None
+            # Bubble diagnostics compare per-line visible glyph size. The raster
+            # AABB can include transparent padding, so publish an equivalent
+            # height while retaining its actual horizontal footprint.
+            if render_box is not None and render_lines and isinstance(visible_ink, (int, float)) and visible_ink > 0:
+                diag_height = max(1, int(round(float(visible_ink) * render_lines)))
+                center_y = (render_box["y_min"] + render_box["y_max"]) / 2.0
+                render_box = dict(render_box)
+                render_box["y_min"] = int(round(center_y - diag_height / 2.0))
+                render_box["y_max"] = render_box["y_min"] + diag_height
             out.append({
                 "id": i,
                 "text": getattr(region, "text", None),
@@ -385,7 +396,7 @@ def _extract_regions_meta(result):
                 "horizontal": bool(getattr(region, "horizontal", False)),
                 "angle": float(getattr(region, "angle", 0) or 0),
                 "lines": lines,
-                "render_lines": int(getattr(region, "_render_lines", 0) or 0) or None,
+                "render_lines": render_lines,
                 "box": _box(region),
                 "render_box": render_box,
                 "bubble_group": getattr(region, "_bubble_group", None),
