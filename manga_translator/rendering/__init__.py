@@ -1448,7 +1448,15 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                 points[j] = np.array([[[sx1, sy1], [sx1 + 1, sy1],
                                        [sx1 + 1, sy1 + marker_h], [sx1, sy1 + marker_h]]],
                                      dtype=np.int64)
-            if (not source_overlap and x < px2 and x + width > px1
+            nested_distinct = (
+                not same_fragment_text
+                and ((source_x1 <= sx1 and source_x2 >= sx2
+                      and source_y1 <= sy1 and source_y2 >= sy2)
+                     or (sx1 <= source_x1 and sx2 >= source_x2
+                         and sy1 <= source_y1 and sy2 >= source_y2))
+            )
+            if (not source_overlap and not nested_distinct
+                    and x < px2 and x + width > px1
                     and y < py2 and y + height > py1):
                 below, above = py2 + 2, py1 - height - 2
                 if below + height <= bottom:
@@ -1505,7 +1513,15 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                           [sx1 + 1, sy1 + marker_h], [sx1, sy1 + marker_h]]],
                         dtype=np.int64)
                     px1, py1, px2, py2 = sx1, sy1, sx1 + 1, sy1 + marker_h
-                if (not source_overlap and x < px2 and x + width > px1
+                nested_distinct = (
+                    not same_fragment_text
+                    and ((source_x1 <= sx1 and source_x2 >= sx2
+                          and source_y1 <= sy1 and source_y2 >= sy2)
+                         or (sx1 <= source_x1 and sx2 >= source_x2
+                             and sy1 <= source_y1 and sy2 >= source_y2))
+                )
+                if (not source_overlap and not nested_distinct
+                        and x < px2 and x + width > px1
                         and y < py2 and y + height > py1):
                     below, above = py2 + 2, py1 - height - 2
                     if below + height <= bottom:
