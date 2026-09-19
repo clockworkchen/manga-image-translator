@@ -1185,6 +1185,11 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                     real = [run for run in runs if run >= max(3, max(runs) * 0.4)]
                     count = max(count, len(real))
         original_counts[i] = count
+        # Multi-row VLM blocks sometimes arrive as one oversized detector quad.
+        # The per-line source hierarchy is bounded by its total height divided by
+        # the measured row count; do not publish the whole block height as a font.
+        if region.horizontal and count > 1:
+            heights[i] = min(heights[i], max(1.0, (box[3] - box[1]) / count))
 
     targets = heights.copy()
     # A page made of many parallel one-line labels is typographic UI/caption
@@ -1213,6 +1218,31 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
         for i in members:
             if median * 0.87 <= heights[i] <= median * 1.15:
                 targets[i] = min(median, heights[i] * 1.10)
+
+    # Merge tiny one-line labels fully embedded in a multi-line VLM block into
+    # that block before rasterization. They are fragments of one visual sentence
+    # (for example a controller hint inside its instruction), and rendering both
+    # independently guarantees overlap while dropping either loses text.
+    aliases = {}
+    for i, region in enumerate(text_regions):
+        if not region.horizontal or original_counts[i] <= 1:
+            continue
+        x1, y1, x2, y2 = boxes[i]
+        broad_area = max((x2 - x1) * (y2 - y1), 1)
+        for j, child in enumerate(text_regions):
+            if i == j or not child.horizontal or original_counts[j] != 1:
+                continue
+            sx1, sy1, sx2, sy2 = boxes[j]
+            child_area = max((sx2 - sx1) * (sy2 - sy1), 1)
+            if (sx1 >= x1 and sx2 <= x2 and sy1 >= y1 and sy2 <= y2
+                    and child_area < broad_area * 0.35):
+                child_translation = str(child.translation or '').strip()
+                broad_translation = str(region.translation or '').strip()
+                child_norm = re.sub(r'\s+', '', child_translation).casefold()
+                broad_norm = re.sub(r'\s+', '', broad_translation).casefold()
+                if child_translation and child_norm not in broad_norm:
+                    region.translation = f'{child_translation} {broad_translation}'.strip()
+                aliases[j] = i
 
     plans = {}
     for i, region in enumerate(text_regions):
@@ -1371,6 +1401,18 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
     points = []
     for i, region in enumerate(text_regions):
         region._bubble_raster = None
+        if i in aliases:
+            marker_h = max(1, int(round(heights[i] * max(original_counts[i], 1))))
+            cx, cy = boxes[i][0], boxes[i][1]
+            region._render_lines = max(1, int(original_counts[i]))
+            region._bubble_retained_lines = True
+            region._bubble_visible_ink_height = float(heights[i])
+            region._bubble_raster = (np.zeros((marker_h, 1, 4), dtype=np.uint8),
+                                     int(round(cx)), int(round(cy)))
+            points.append(np.array([[[cx, cy], [cx + 1, cy],
+                                     [cx + 1, cy + marker_h], [cx, cy + marker_h]]],
+                                   dtype=np.int64))
+            continue
         if i not in plans:
             # Deliberate fail-closed behavior: do not let the generic renderer
             # silently emit unreadable 3px text after bubble fitting failed.
