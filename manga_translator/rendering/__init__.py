@@ -1537,11 +1537,10 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                 angle, resample=Image.Resampling.BICUBIC, expand=True)
             raster = np.asarray(rgba)
             height, width = raster.shape[:2]
-            # Rotation enlarges the raster and can reduce visible ink again during
-            # the containment step below. Track actual alpha ink after rotation,
-            # not the nominal pre-rotation line height.
-            alpha_rows = _bubble_ink_runs(raster[:, :, 3])
-            rotated_visible = max(alpha_rows, default=height)
+            # A rotated block's vertical alpha run includes width*sin(angle), so
+            # it is not a glyph-height measurement. Keep the pre-rotation visible
+            # per-line height and apply only the later containment scale.
+            rotated_visible = visible * scale
             source_x1, source_y1, source_x2, source_y2 = map(float, region.xyxy)
             contain = min((source_x2-source_x1) / max(width, 1),
                           (source_y2-source_y1) / max(height, 1), 1.0)
