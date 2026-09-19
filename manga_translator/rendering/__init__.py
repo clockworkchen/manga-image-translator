@@ -1403,7 +1403,10 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
         region._bubble_raster = None
         if i in aliases:
             marker_h = max(1, int(round(heights[i] * max(original_counts[i], 1))))
-            cx, cy = boxes[i][0], boxes[i][1]
+            marker_bounds = getattr(region, '_bubble_bounds', boxes[i])
+            cx = max(float(marker_bounds[0]), float(boxes[i][0]))
+            cy = max(float(marker_bounds[1]), float(boxes[i][1]))
+            cy = min(cy, max(float(marker_bounds[1]), float(marker_bounds[3]) - marker_h))
             region._render_lines = max(1, int(original_counts[i]))
             region._bubble_retained_lines = True
             region._bubble_visible_ink_height = float(heights[i])
