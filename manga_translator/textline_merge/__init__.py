@@ -1,4 +1,5 @@
 import itertools
+import re
 import numpy as np
 from typing import List, Set
 from collections import Counter
@@ -320,6 +321,16 @@ def merge_stacked_open_regions(regions):
     No background ownership is assumed. Merge only adjacent, centred, same-style
     horizontal rows whose union cannot plausibly be two columns.
     """
+    # Bracket-prefixed game commands are independent menu rows even when they
+    # share type, colour and leading. Merging them produces one tall paragraph,
+    # erases multiple UI rows at once and makes a partial OCR look like recall.
+    bracketed = sum(bool(re.match(
+        r'^\s*[【\[（(「『〈《].{1,30}[】\]）)」』〉》]', str(region.text or '')))
+        for region in regions)
+    if len(regions) >= 4 and bracketed >= 3 and bracketed / len(regions) >= 0.5:
+        for region in regions:
+            region._layout_profile = 'game_ui'
+        return regions
     from ..rendering import _aabb_of
     boxes = [_aabb_of(region.min_rect) for region in regions]
     used, out = set(), []
@@ -374,8 +385,21 @@ async def dispatch(textlines: List[Quadrilateral], width: int, height: int, verb
     #     print(s)
 
     text_regions: List[TextBlock] = []
-    for (txtlns, fg_color, bg_color) in merge_bboxes_text_region(textlines, width, height,
-                                                                 **(merge_opts or {})):
+    # Game/menu screens often consist of repeated bracketed commands. Their
+    # vertical rhythm resembles a paragraph, but every row is a separate action.
+    # Keep those detector rows independent before the generic graph merger can
+    # collapse the whole menu into one region.
+    bracketed = sum(bool(re.match(
+        r'^\s*[【\[（(「『〈《].{1,30}[】\]）)」』〉》]', str(line.text or '')))
+        for line in textlines)
+    game_ui = (len(textlines) >= 4 and bracketed >= 3
+               and bracketed / len(textlines) >= 0.5)
+    if game_ui:
+        merged_regions = [([line], line.fg_colors, line.bg_colors) for line in textlines]
+    else:
+        merged_regions = merge_bboxes_text_region(textlines, width, height,
+                                                   **(merge_opts or {}))
+    for (txtlns, fg_color, bg_color) in merged_regions:
         total_logprobs = 0
         for txtln in txtlns:
             total_logprobs += np.log(txtln.prob) * txtln.area
@@ -406,5 +430,7 @@ async def dispatch(textlines: List[Quadrilateral], width: int, height: int, verb
         block_ids = {getattr(line, 'ocr_block_id', None) for line in txtlns}
         block_ids.discard(None)
         region.ocr_block_ids = block_ids
+        if game_ui:
+            region._layout_profile = 'game_ui'
         text_regions.append(region)
     return text_regions

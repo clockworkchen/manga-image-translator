@@ -805,6 +805,19 @@ class MangaTranslator:
             from .textline_merge import merge_closed_bubble_regions, merge_stacked_open_regions
             text_regions = merge_closed_bubble_regions(text_regions, ctx.img_rgb)
             text_regions = merge_stacked_open_regions(text_regions)
+            # The public manga route also receives game/menu screenshots. Those
+            # are not speech balloons: many aligned rows with bracketed command
+            # labels must stay as independent UI items. Detect this from OCR
+            # geometry/text inside MT (not Panel routing/config) and opt those
+            # regions out of bubble regrouping/layout.
+            bracketed_rows = sum(bool(re.match(
+                r'^\s*[【\[（(「『〈《].{1,30}[】\]）)」』〉》]', str(r.text or '')))
+                for r in text_regions)
+            if (len(text_regions) >= 4 and bracketed_rows >= 3
+                    and bracketed_rows / len(text_regions) >= 0.5):
+                for region in text_regions:
+                    region._layout_profile = 'game_ui'
+                logger.info(f'Adaptive layout: game_ui ({bracketed_rows}/{len(text_regions)} bracketed rows)')
 
         new_text_regions = []
         for region in text_regions:
@@ -1448,6 +1461,26 @@ class MangaTranslator:
                                               getattr(config.render, "overflow_strategy", "expand"),
                                               getattr(config.render, "max_font_shrink_ratio", 0.5),
                                               original_img=ctx.img_rgb)
+        if config.render.overflow_strategy == 'bubble':
+            # Bubble fitting happens after mask generation/inpainting. If a
+            # translated region cannot produce a visible raster, restoring its
+            # original masked pixels is the only safe outcome: never erase text
+            # (or a bubble outline) without committing replacement text.
+            rejected = [region for region in ctx.text_regions
+                        if not (getattr(region, 'translation', '') or '').strip()
+                        or (not getattr(region, '_render_committed', False)
+                            and not getattr(region, '_render_suppressed_duplicate', False))]
+            if rejected and ctx.mask is not None:
+                restore_mask = await dispatch_mask_refinement(
+                    rejected, ctx.img_rgb, ctx.mask_raw, 'fit_text',
+                    config.mask_dilation_offset, config.ocr.ignore_bubble,
+                    self.verbose, self.kernel_size, bubble_mode=True)
+                if restore_mask is not None:
+                    restore = restore_mask > 0
+                    output[restore] = ctx.img_rgb[restore]
+                    logger.warning(
+                        f'Restored original pixels for {len(rejected)} '
+                        'unrenderable/empty bubble regions')
         return output
 
     def _result_path(self, path: str) -> str:

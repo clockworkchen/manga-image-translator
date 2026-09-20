@@ -1412,6 +1412,7 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
             region._bubble_visible_ink_height = float(heights[i])
             region._bubble_raster = (np.zeros((marker_h, 1, 4), dtype=np.uint8),
                                      int(round(cx)), int(round(cy)))
+            region._render_suppressed_duplicate = True
             points.append(np.array([[[cx, cy], [cx + 1, cy],
                                      [cx + 1, cy + marker_h], [cx, cy + marker_h]]],
                                    dtype=np.int64))
@@ -1490,6 +1491,7 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                 marker_h = max(1, int(round(getattr(text_regions[j], '_bubble_visible_ink_height', 1))))
                 text_regions[j]._bubble_raster = (
                     np.zeros((marker_h, 1, 4), dtype=np.uint8), int(round(sx1)), int(round(sy1)))
+                text_regions[j]._render_suppressed_duplicate = True
                 points[j] = np.array([[[sx1, sy1], [sx1 + 1, sy1],
                                        [sx1 + 1, sy1 + marker_h], [sx1, sy1 + marker_h]]],
                                      dtype=np.int64)
@@ -1553,6 +1555,7 @@ def _fit_regions_bubble(img, text_regions, original_img, hyphenate, line_spacing
                     text_regions[j]._bubble_raster = (
                         np.zeros((marker_h, 1, 4), dtype=np.uint8),
                         int(round(sx1)), int(round(sy1)))
+                    text_regions[j]._render_suppressed_duplicate = True
                     points[j] = np.array(
                         [[[sx1, sy1], [sx1 + 1, sy1],
                           [sx1 + 1, sy1 + marker_h], [sx1, sy1 + marker_h]]],
@@ -1637,6 +1640,15 @@ async def dispatch(
     text_render.set_font(font_path)
     text_regions = list(filter(lambda region: region.translation, text_regions))
 
+    # Rendering and inpainting are one transaction. The caller prepares a mask
+    # before this function, but bubble fitting can still reject a region later
+    # (unreadable size/collision/no raster). Publish that decision to the caller;
+    # it will restore the original pixels for every rejected region so a failed
+    # layout can never leave an erased hole behind.
+    for region in text_regions:
+        region._render_committed = False
+        region._render_suppressed_duplicate = False
+
     # Clear private raster state when callers reuse TextBlocks for another mode.
     for region in text_regions:
         region._bubble_raster = None
@@ -1689,13 +1701,16 @@ async def dispatch(
                     crop = img[iy1:iy2, ix1:ix2]
                     local_alpha = alpha[ry1:ry2, rx1:rx2]
                     local_rgb = raster[ry1:ry2, rx1:rx2, :3]
-                    crop[:] = np.clip(crop.astype(np.float32) * (1 - local_alpha) +
-                                      local_rgb.astype(np.float32) * local_alpha, 0, 255).astype(np.uint8)
+                    if np.any(local_alpha > 0):
+                        crop[:] = np.clip(crop.astype(np.float32) * (1 - local_alpha) +
+                                          local_rgb.astype(np.float32) * local_alpha, 0, 255).astype(np.uint8)
+                        region._render_committed = True
             # Raster has already been fitted using visible ink. No second wrap
             # or homography stretch back to a nominal n-line detection box.
             region._bubble_raster = None
         else:
             img = render(img, region, dst_points, hyphenate, line_spacing, disable_font_border)
+            region._render_committed = True
     return img
 
 def render(

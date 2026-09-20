@@ -406,6 +406,10 @@ def _extract_regions_meta(result):
                 "bubble_boundary_kind": getattr(region, "_bubble_boundary_kind", None),
                 "bubble_bounds": getattr(region, "_bubble_bounds", None),
                 "bubble_layout_failed": getattr(region, "_bubble_layout_failed", None),
+                "render_committed": getattr(region, "_render_committed", None),
+                "render_suppressed_duplicate": getattr(
+                    region, "_render_suppressed_duplicate", None),
+                "layout_profile": getattr(region, "_layout_profile", "comic"),
             })
         except Exception as e:
             out.append({"id": i, "error": str(e)})
