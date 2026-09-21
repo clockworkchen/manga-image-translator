@@ -22,6 +22,43 @@ from ..utils import (
 
 logger = get_logger('render')
 
+# A committed render must contain enough actually composited glyph coverage to
+# replace the source region. This rejects degenerate homographies/raster crops
+# such as case031's one-pixel output while retaining small but real text.
+_RENDER_ALPHA_THRESHOLD = 16
+_RENDER_MIN_VISIBLE_PIXELS = 8
+_RENDER_MIN_REGION_COVERAGE = 0.001
+
+
+def _visible_render_stats(alpha_u8, region_area, before=None, after=None):
+    """Measure final alpha and actual composited pixel changes.
+
+    Alpha proves that a glyph raster exists; ``before``/``after`` prove it changed
+    the final canvas. Both are required because drawing a near-background colour
+    can yield thousands of alpha pixels but only one visible output pixel.
+    """
+    visible_pixels = int(np.count_nonzero(alpha_u8 >= _RENDER_ALPHA_THRESHOLD))
+    region_area = max(float(region_area), 1.0)
+    visible_ratio = visible_pixels / region_area
+    changed_pixels = visible_pixels
+    changed_ratio = visible_ratio
+    if before is not None and after is not None and before.shape == after.shape:
+        delta = np.max(np.abs(after.astype(np.int16) - before.astype(np.int16)), axis=2)
+        changed_pixels = int(np.count_nonzero(delta > 12))
+        changed_ratio = changed_pixels / region_area
+    return {
+        'accepted': (visible_pixels >= _RENDER_MIN_VISIBLE_PIXELS
+                     and visible_ratio >= _RENDER_MIN_REGION_COVERAGE
+                     and changed_pixels >= _RENDER_MIN_VISIBLE_PIXELS
+                     and changed_ratio >= _RENDER_MIN_REGION_COVERAGE),
+        'visible_alpha_pixels': visible_pixels,
+        'visible_alpha_ratio': float(visible_ratio),
+        'visible_changed_pixels': changed_pixels,
+        'visible_changed_ratio': float(changed_ratio),
+        'render_region_area': float(region_area),
+    }
+
+
 def parse_font_paths(path: str, default: List[str] = None) -> List[str]:
     if path:
         parsed = path.split(',')
@@ -1692,25 +1729,47 @@ async def dispatch(
             if prepared is not None:
                 raster, x, y = prepared
                 h, w = raster.shape[:2]
-                alpha = raster[:, :, 3:4].astype(np.float32) / 255.0
+                alpha_u8 = raster[:, :, 3]
                 ix1, iy1 = max(0, x), max(0, y)
                 ix2, iy2 = min(img.shape[1], x+w), min(img.shape[0], y+h)
                 if ix2 > ix1 and iy2 > iy1:
                     rx1, ry1 = ix1-x, iy1-y
                     rx2, ry2 = rx1+(ix2-ix1), ry1+(iy2-iy1)
+                    local_alpha_u8 = alpha_u8[ry1:ry2, rx1:rx2]
+                    region_area = abs(float(cv2.contourArea(
+                        np.asarray(dst_points, dtype=np.float32).reshape(-1, 2))))
                     crop = img[iy1:iy2, ix1:ix2]
-                    local_alpha = alpha[ry1:ry2, rx1:rx2]
+                    before = crop.copy()
+                    local_alpha = local_alpha_u8[:, :, None].astype(np.float32) / 255.0
                     local_rgb = raster[ry1:ry2, rx1:rx2, :3]
-                    if np.any(local_alpha > 0):
-                        crop[:] = np.clip(crop.astype(np.float32) * (1 - local_alpha) +
-                                          local_rgb.astype(np.float32) * local_alpha, 0, 255).astype(np.uint8)
+                    candidate = np.clip(before.astype(np.float32) * (1 - local_alpha) +
+                                        local_rgb.astype(np.float32) * local_alpha,
+                                        0, 255).astype(np.uint8)
+                    stats = _visible_render_stats(local_alpha_u8, region_area, before, candidate)
+                    region._render_visible_alpha_pixels = stats['visible_alpha_pixels']
+                    region._render_visible_alpha_ratio = stats['visible_alpha_ratio']
+                    region._render_visible_changed_pixels = stats['visible_changed_pixels']
+                    region._render_visible_changed_ratio = stats['visible_changed_ratio']
+                    region._render_region_area = stats['render_region_area']
+                    if stats['accepted']:
+                        crop[:] = candidate
                         region._render_committed = True
+                    else:
+                        region._render_reject_reason = 'insufficient_visible_output'
             # Raster has already been fitted using visible ink. No second wrap
             # or homography stretch back to a nominal n-line detection box.
             region._bubble_raster = None
         else:
-            img = render(img, region, dst_points, hyphenate, line_spacing, disable_font_border)
-            region._render_committed = True
+            img, render_stats = render(img, region, dst_points, hyphenate, line_spacing,
+                                       disable_font_border, return_stats=True)
+            region._render_visible_alpha_pixels = render_stats['visible_alpha_pixels']
+            region._render_visible_alpha_ratio = render_stats['visible_alpha_ratio']
+            region._render_visible_changed_pixels = render_stats['visible_changed_pixels']
+            region._render_visible_changed_ratio = render_stats['visible_changed_ratio']
+            region._render_region_area = render_stats['render_region_area']
+            region._render_committed = render_stats['accepted']
+            if not render_stats['accepted']:
+                region._render_reject_reason = 'insufficient_visible_output'
     return img
 
 def render(
@@ -1719,7 +1778,8 @@ def render(
     dst_points,
     hyphenate,
     line_spacing,
-    disable_font_border
+    disable_font_border,
+    return_stats=False,
 ):
     fg, bg = region.get_font_colors()
     fg, bg = fg_bg_compare(fg, bg)
@@ -1772,7 +1832,10 @@ def render(
         )
     h, w, _ = temp_box.shape
     if h < 1 or w < 1:
-        return img
+        stats = {'accepted': False, 'visible_alpha_pixels': 0,
+                 'visible_alpha_ratio': 0.0, 'visible_changed_pixels': 0,
+                 'visible_changed_ratio': 0.0, 'render_region_area': 0.0}
+        return (img, stats) if return_stats else img
     r_temp = float(w) / float(h)
 
     # Extend temporary box so that it has same ratio as original
@@ -1866,12 +1929,36 @@ def render(
     #src_pts[:, 1] = np.clip(np.round(src_pts[:, 1]), 0, enlarged_h * 2)
 
     M, _ = cv2.findHomography(src_points, dst_points, cv2.RANSAC, 5.0)
+    if M is None:
+        stats = {'accepted': False, 'visible_alpha_pixels': 0,
+                 'visible_alpha_ratio': 0.0, 'visible_changed_pixels': 0,
+                 'visible_changed_ratio': 0.0, 'render_region_area': 0.0}
+        return (img, stats) if return_stats else img
     rgba_region = cv2.warpPerspective(box, M, (img.shape[1], img.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     x, y, w, h = cv2.boundingRect(dst_points.astype(np.int32))
-    canvas_region = rgba_region[y:y+h, x:x+w, :3]
-    mask_region = rgba_region[y:y+h, x:x+w, 3:4].astype(np.float32) / 255.0
-    img[y:y+h, x:x+w] = np.clip((img[y:y+h, x:x+w].astype(np.float32) * (1 - mask_region) + canvas_region.astype(np.float32) * mask_region), 0, 255).astype(np.uint8)
-    return img
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(img.shape[1], x + w), min(img.shape[0], y + h)
+    region_area = abs(float(cv2.contourArea(
+        np.asarray(dst_points, dtype=np.float32).reshape(-1, 2))))
+    if x2 <= x1 or y2 <= y1:
+        stats = _visible_render_stats(np.zeros((0, 0), dtype=np.uint8), region_area)
+        return (img, stats) if return_stats else img
+    alpha_u8 = rgba_region[y1:y2, x1:x2, 3]
+    stats = _visible_render_stats(alpha_u8, region_area)
+    if not stats['accepted']:
+        return (img, stats) if return_stats else img
+    canvas_region = rgba_region[y1:y2, x1:x2, :3]
+    mask_region = alpha_u8[:, :, None].astype(np.float32) / 255.0
+    before = img[y1:y2, x1:x2].copy()
+    candidate = np.clip(
+        before.astype(np.float32) * (1 - mask_region)
+        + canvas_region.astype(np.float32) * mask_region,
+        0, 255).astype(np.uint8)
+    stats = _visible_render_stats(alpha_u8, region_area, before, candidate)
+    if not stats['accepted']:
+        return (img, stats) if return_stats else img
+    img[y1:y2, x1:x2] = candidate
+    return (img, stats) if return_stats else img
 
 async def dispatch_eng_render(img_canvas: np.ndarray, original_img: np.ndarray, text_regions: List[TextBlock], font_path: str = '', line_spacing: int = 0, disable_font_border: bool = False) -> np.ndarray:
     if len(text_regions) == 0:

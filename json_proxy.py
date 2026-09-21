@@ -409,6 +409,17 @@ def _extract_regions_meta(result):
                 "render_committed": getattr(region, "_render_committed", None),
                 "render_suppressed_duplicate": getattr(
                     region, "_render_suppressed_duplicate", None),
+                "render_visible_alpha_pixels": getattr(
+                    region, "_render_visible_alpha_pixels", None),
+                "render_visible_alpha_ratio": getattr(
+                    region, "_render_visible_alpha_ratio", None),
+                "render_region_area": getattr(region, "_render_region_area", None),
+                "render_visible_changed_pixels": getattr(
+                    region, "_render_visible_changed_pixels", None),
+                "render_visible_changed_ratio": getattr(
+                    region, "_render_visible_changed_ratio", None),
+                "render_reject_reason": getattr(region, "_render_reject_reason", None),
+                "translation_structure": getattr(region, "_translation_structure", None),
                 "layout_profile": getattr(region, "_layout_profile", "comic"),
             })
         except Exception as e:

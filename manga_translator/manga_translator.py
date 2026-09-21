@@ -1073,29 +1073,114 @@ class MangaTranslator:
         )
 
     @staticmethod
-    def _preserve_bracket_structure(source: str, translation: str) -> str:
-        """Restore one leading 【...】 group when the translator drops/moves it.
+    def _leading_bracket_tail(text: str):
+        """Return the leading 【label】 and meaningful source tail, if present."""
+        match = re.match(r'^\s*(【[^】]+】)([\s\S]*)$', str(text or ''))
+        if not match:
+            return None
+        tail = match.group(2).strip()
+        if not re.search(r'[\w\u3040-\u30ff\u3400-\u9fff]', tail):
+            return None
+        return match.group(1), tail
 
-        This is a layout constraint, not a translation rewrite. If the source
-        begins with a bracketed label and the target still contains a bracket
-        group, normalize it to the front. If brackets were dropped entirely,
-        wrap the target phrase before a short causative suffix such as 让做/让其做.
+    @classmethod
+    def _bracket_tail_validation(cls, source: str, translation: str):
+        """Validate that a leading-label source did not collapse to only a label.
+
+        The check is deliberately structural. It never guesses what the omitted
+        clause means; it merely proves that meaningful content still exists after
+        the translated leading bracket group.
+        """
+        source_parts = cls._leading_bracket_tail(source)
+        if not source_parts:
+            return {'required': False, 'valid': True, 'reason': None}
+        translated = str(translation or '').strip()
+        target = re.match(r'^\s*【[^】]+】([\s\S]*)$', translated)
+        if not target:
+            return {'required': True, 'valid': False,
+                    'reason': 'missing_leading_bracket_group'}
+        target_tail = target.group(1).strip()
+        valid = bool(re.search(r'[\w\u3040-\u30ff\u3400-\u9fff]', target_tail))
+        return {'required': True, 'valid': valid,
+                'reason': None if valid else 'missing_semantic_tail'}
+
+    @staticmethod
+    def _preserve_bracket_structure(source: str, translation: str) -> str:
+        """Normalize an existing translated 【...】 group to the source-leading position.
+
+        This function intentionally does not create brackets or semantic suffixes:
+        structure recovery must use model output, never a guessed meaning.
         """
         source = str(source or '').strip()
         translation = str(translation or '').strip()
         if not re.match(r'^【[^】]+】', source):
             return translation
         group = re.search(r'【\s*([^】]+?)\s*】', translation)
-        if group:
-            label = group.group(1).strip()
-            rest = (translation[:group.start()] + translation[group.end():]).strip()
-            return f'【{label}】{rest}'
-        suffix = re.search(r'(让(?:她|他|其)?做.*)$', translation)
-        if suffix and suffix.start() > 0:
-            label = translation[:suffix.start()].strip(' ，,。')
-            if label:
-                return f'【{label}】{suffix.group(1)}'
-        return f'【{translation}】' if translation else translation
+        if not group:
+            return translation
+        label = group.group(1).strip()
+        rest = (translation[:group.start()] + translation[group.end():]).strip()
+        return f'【{label}】{rest}'
+
+    async def _repair_bracket_tail_translations(self, regions, config: Config, ctx: Context):
+        """Retry structurally truncated translations once, then fail closed.
+
+        A retry is a single low-frequency batch containing only failed regions.
+        If it still omits the source tail, preserve the original region in the
+        final image by clearing its translation before mask generation.
+        """
+        failed = []
+        for index, region in enumerate(regions):
+            check = self._bracket_tail_validation(region.text, region.translation)
+            region._translation_structure = {
+                'check': 'leading_bracket_semantic_tail',
+                'required': check['required'],
+                'initial_valid': check['valid'],
+                'initial_translation': region.translation,
+                'retry_attempted': False,
+                'retry_valid': None,
+                'accepted': check['valid'],
+                'action': 'accepted' if check['valid'] else 'retry_pending',
+                'reason': check['reason'],
+            }
+            if check['required'] and not check['valid']:
+                failed.append((index, region))
+        if not failed:
+            return
+
+        # The explicit sentinel makes semantic ownership part of the translation
+        # protocol without providing or guessing a target-language answer. The
+        # sentinel is stripped before validation/rendering.
+        sentinel = '⟦KEEP_COMPLETE_TRAILING_SEMANTICS⟧'
+        retry_sources = [f'{sentinel}{region.text}' for _, region in failed]
+        logger.warning('Retrying %d translations with missing post-bracket semantics', len(failed))
+        try:
+            retried = await self._batch_translate_texts(retry_sources, config, ctx)
+        except Exception as exc:
+            retried = []
+            logger.error('Bracket-tail retry failed: %s', exc)
+        for retry_index, (_, region) in enumerate(failed):
+            meta = region._translation_structure
+            meta['retry_attempted'] = True
+            candidate = retried[retry_index] if retry_index < len(retried) else ''
+            candidate = str(candidate or '').replace(sentinel, '').strip()
+            candidate = self._preserve_leading_bracket_group(region.text, candidate)
+            candidate = self._preserve_bracket_structure(region.text, candidate)
+            retry_check = self._bracket_tail_validation(region.text, candidate)
+            meta['retry_translation'] = candidate
+            meta['retry_valid'] = retry_check['valid']
+            meta['reason'] = retry_check['reason']
+            if retry_check['valid']:
+                region.translation = candidate
+                meta['accepted'] = True
+                meta['action'] = 'accepted_retry'
+            else:
+                # No invented suffix. An empty translation removes the region
+                # before mask generation, retaining the complete source pixels.
+                region.translation = ''
+                meta['accepted'] = False
+                meta['action'] = 'preserve_original'
+                logger.error('Rejected structurally truncated translation for source %r', region.text)
 
     @staticmethod
     def _preserve_leading_bracket_group(source: str, translation: str) -> str:
@@ -1386,6 +1471,12 @@ class MangaTranslator:
             else:
                 logger.warning("Some translation regions failed post-translation check.")
 
+        # Final semantic-integrity gate. Run after dictionaries and every optional
+        # post-check retry so no later stage can replace a validated translation
+        # with a bracket-only truncation. Failed repairs are cleared and filtered
+        # before mask generation, which preserves the complete original pixels.
+        await self._repair_bracket_tail_translations(ctx.text_regions, config, ctx)
+
         # 过滤逻辑（简化版本，保留主要过滤条件）
         new_text_regions = []
         for region in ctx.text_regions:
@@ -1461,26 +1552,27 @@ class MangaTranslator:
                                               getattr(config.render, "overflow_strategy", "expand"),
                                               getattr(config.render, "max_font_shrink_ratio", 0.5),
                                               original_img=ctx.img_rgb)
-        if config.render.overflow_strategy == 'bubble':
-            # Bubble fitting happens after mask generation/inpainting. If a
-            # translated region cannot produce a visible raster, restoring its
-            # original masked pixels is the only safe outcome: never erase text
-            # (or a bubble outline) without committing replacement text.
+        # Rendering and inpainting are one transaction for every default-renderer
+        # strategy. A region is committed only after its final on-canvas alpha has
+        # sufficient pixel count and source-region coverage. Otherwise restore the
+        # exact original masked pixels; never publish an erased region as success.
+        if config.render.renderer not in (Renderer.none, Renderer.manga2Eng, Renderer.manga2EngPillow):
             rejected = [region for region in ctx.text_regions
                         if not (getattr(region, 'translation', '') or '').strip()
                         or (not getattr(region, '_render_committed', False)
                             and not getattr(region, '_render_suppressed_duplicate', False))]
             if rejected and ctx.mask is not None:
+                bubble_mode = config.render.overflow_strategy == 'bubble'
                 restore_mask = await dispatch_mask_refinement(
                     rejected, ctx.img_rgb, ctx.mask_raw, 'fit_text',
                     config.mask_dilation_offset, config.ocr.ignore_bubble,
-                    self.verbose, self.kernel_size, bubble_mode=True)
+                    self.verbose, self.kernel_size, bubble_mode=bubble_mode)
                 if restore_mask is not None:
                     restore = restore_mask > 0
                     output[restore] = ctx.img_rgb[restore]
                     logger.warning(
                         f'Restored original pixels for {len(rejected)} '
-                        'unrenderable/empty bubble regions')
+                        'uncommitted/empty rendered regions')
         return output
 
     def _result_path(self, path: str) -> str:
